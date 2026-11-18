@@ -1,3 +1,7 @@
+---
+permalink: /privacy/
+---
+
 # Privacy policy for the Drive Artifacts app
 
 *Effective 2026-11-17.*
