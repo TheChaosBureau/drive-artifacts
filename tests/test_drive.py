@@ -810,3 +810,14 @@ def test_upload_converges_under_random_faults(
     src.write_bytes(_blob(size))
     f = drive.upload_file(src, name="z", parent=None, app_properties={"k": "v"})
     assert fake.files[f.id].content == _blob(size)
+
+
+def test_list_files_stops_after_max_pages(drive: DriveClient, fake: FakeDrive) -> None:
+    for i in range(5):
+        fake.add_file(f"f{i}", b"x", props={"k": "v"})
+    q = "appProperties has { key='k' and value='v' } and trashed = false"
+    assert len(drive.list_files(q, page_size=2)) == 5
+    before = len(fake.requests)
+    assert len(drive.list_files(q, page_size=2, max_pages=1)) == 2
+    assert len(fake.requests) - before == 1
+    assert len(drive.list_files(q, page_size=2, max_pages=2)) == 4

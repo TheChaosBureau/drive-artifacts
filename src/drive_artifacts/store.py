@@ -100,9 +100,11 @@ class ArtifactStore:
         return self._folder(q, maker)
 
     # ----- artifacts ---------------------------------------------------------
-    def _records(self, *terms: str, order_by: str | None = None) -> list[ArtifactRecord]:
+    def _records(
+        self, *terms: str, order_by: str | None = None, max_pages: int | None = None
+    ) -> list[ArtifactRecord]:
         files = self._drive.list_files(
-            query(prop("da.kind", "artifact"), *terms), order_by=order_by
+            query(prop("da.kind", "artifact"), *terms), order_by=order_by, max_pages=max_pages
         )
         records: list[ArtifactRecord] = []
         for file in files:
@@ -158,7 +160,13 @@ class ArtifactStore:
         ):
             # The last chunk's answer carries these only when the session's `fields` reached it;
             # read the file rather than check sizes (or order uploads) against blanks.
-            uploaded = self._drive.get_file(uploaded.id)
+            try:
+                uploaded = self._drive.get_file(uploaded.id)
+            except DriveArtifactsError:
+                # Stored but unverified: the same rule as a size mismatch below.
+                with suppress(DriveArtifactsError):
+                    self._drive.trash(uploaded.id)
+                raise
         record = ArtifactRecord.from_drive(uploaded.as_mapping())
         if record.size != size:
             # Never leave a half-good artifact behind: it would make a plain retry conflict.
@@ -221,7 +229,8 @@ class ArtifactStore:
             terms.append(prop("da.ref", fit_ref(ref)))
         if commit is not None:
             terms.append(prop("da.commit", commit))
-        records = self._records(*terms, order_by="createdTime desc")
+        # Newest first, so the answer is on the first page: one request, however many there are.
+        records = self._records(*terms, order_by="createdTime desc", max_pages=1)
         return records[0] if records else None
 
     def fetch(self, record: ArtifactRecord, dest_zip: Path) -> None:

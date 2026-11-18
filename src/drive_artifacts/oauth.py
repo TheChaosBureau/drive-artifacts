@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-from drive_artifacts.errors import AuthError
+from drive_artifacts.errors import AuthError, UsageError
 from drive_artifacts.settings import SCOPE, Settings
 
 REFRESH_MARGIN_S = 60.0
@@ -271,7 +271,10 @@ def loopback_login(
 
         do_POST = do_PUT = do_PATCH = do_DELETE = _refuse  # noqa: N815 - stdlib dispatch names
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    try:
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+    except OSError as exc:
+        raise UsageError(f"could not open a local port for the login: {exc}") from exc
     try:
         redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/"
         open_browser(

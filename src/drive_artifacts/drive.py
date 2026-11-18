@@ -271,10 +271,17 @@ class DriveClient:
         return DriveFile.from_json(response.json())
 
     def list_files(
-        self, q: str, *, order_by: str | None = None, page_size: int = 100
+        self,
+        q: str,
+        *,
+        order_by: str | None = None,
+        page_size: int = 100,
+        max_pages: int | None = None,
     ) -> list[DriveFile]:
+        """Every match, or only the first `max_pages` pages of them."""
         files: list[DriveFile] = []
         token: str | None = None
+        pages = 0
         while True:
             params = {
                 "q": q,
@@ -289,7 +296,8 @@ class DriveClient:
             body = self._request("GET", f"{self._api}/files", params=params).json()
             files.extend(DriveFile.from_json(f) for f in body.get("files", []))
             token = body.get("nextPageToken")
-            if not token:
+            pages += 1
+            if not token or (max_pages is not None and pages >= max_pages):
                 return files
 
     def get_file(self, file_id: str) -> DriveFile:

@@ -654,3 +654,55 @@ def test_a_full_final_chunk_response_needs_no_extra_read(
     path, digest, size = _zip(tmp_path, "w.zip", b"one")
     rec = store.put(ctx, "wheel", path, sha256=digest, size=size, retention_days=1)
     assert _metadata_gets(fake, rec.file_id) == 0
+
+
+def _list_requests(fake: FakeDrive) -> int:
+    return sum(1 for r in fake.requests if r.method == "GET" and r.url.path.endswith("/files"))
+
+
+def test_latest_reads_the_first_page_only(
+    store: ArtifactStore, ctx: RunContext, fake: FakeDrive, tmp_path: Path
+) -> None:
+    """The newest artifact is on the first page of a newest-first listing: a repository with
+    thousands of artifacts must not be listed in full for one download."""
+    path, digest, size = _zip(tmp_path, "w.zip", b"one")
+    first = store.put(ctx, "wheel", path, sha256=digest, size=size, retention_days=1)
+    parent = fake.files[first.file_id].parents[0]
+    for _ in range(250):
+        _add_duplicate(fake, parent, digest)
+    before = _list_requests(fake)
+    assert store.latest("987", "wheel") is not None
+    assert _list_requests(fake) - before == 1
+    before = _list_requests(fake)
+    assert len(store.list_repo("987")) == 251  # a listing still walks every page
+    assert _list_requests(fake) - before == 3
+
+
+def test_a_failed_re_read_after_a_bare_final_response_trashes_the_upload(
+    store: ArtifactStore,
+    drive: DriveClient,
+    ctx: RunContext,
+    fake: FakeDrive,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The upload is in Drive but its size could not be verified: like a size mismatch, it must
+    not stay live, or a plain retry would conflict with it."""
+    fake.bare_final_response = True
+    real = drive.get_file
+    fail_next = [True]
+
+    def get_file(file_id: str) -> DriveFile:
+        if fail_next[0]:
+            fail_next[0] = False
+            raise DriveError("Drive answered 500", status=500, reason="backendError")
+        return real(file_id)
+
+    monkeypatch.setattr(drive, "get_file", get_file)
+    path, digest, size = _zip(tmp_path, "w.zip", b"payload")
+    with pytest.raises(DriveError, match="500"):
+        store.put(ctx, "wheel", path, sha256=digest, size=size, retention_days=1)
+    artifacts = [f for f in fake.files.values() if f.app_properties.get("da.kind") == "artifact"]
+    assert [f.trashed for f in artifacts] == [True]
+    retry = store.put(ctx, "wheel", path, sha256=digest, size=size, retention_days=1)  # no conflict
+    assert not fake.files[retry.file_id].trashed
