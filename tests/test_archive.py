@@ -117,7 +117,9 @@ def test_zip_slip_is_rejected(tmp_path: Path, name: str) -> None:
         zf.writestr(name, b"x")
     with pytest.raises(IntegrityError):
         safe_extract(tmp_path / "bad.zip", tmp_path / "o")
-    assert not (tmp_path / "evil").exists()
+    # Whatever the name aimed at, nothing was written: not beside the destination, not in it.
+    assert sorted(p.name for p in tmp_path.iterdir()) in (["bad.zip"], ["bad.zip", "o"])
+    assert list((tmp_path / "o").rglob("*")) == []
 
 
 def test_limits_are_enforced(tmp_path: Path) -> None:
@@ -536,3 +538,77 @@ def test_round_trip_restores_the_tree(files: dict[str, bytes]) -> None:
         assert sorted(
             p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file()
         ) == sorted(files)
+
+
+# ----- edges from the pre-release reviews ------------------------------------------------------
+
+
+@pytest.mark.parametrize("pattern", ["dist", "dist/", "dist/*", "dist/**", "dist/**/*", "**"])
+def test_a_directory_link_reached_through_a_wildcard_is_not_descended(
+    linked_tree: Path, pattern: str
+) -> None:
+    """A wildcard must not do what a walk refuses to: `dist/*` and `**` see exactly the files
+    `dist` sees. Only a pattern that names the link itself makes it the top of a walk."""
+    files = resolve_paths([pattern], linked_tree).files
+    assert [p.relative_to(linked_tree).as_posix() for p in files] == ["dist/link", "dist/real.txt"]
+
+
+def test_a_cyclic_directory_link_under_a_recursive_wildcard_is_archived_once(
+    linked_tree: Path, tmp_path: Path
+) -> None:
+    """Python 3.11 and 3.12 follow directory links under `**`, 3.13 does not; a link back to an
+    ancestor used to put dozens of copies of the tree into the archive on the older two."""
+    make_tree(linked_tree, {"dist/sub/deep.txt": b"deep"})
+    (linked_tree / "dist" / "sub" / "loop").symlink_to(
+        linked_tree / "dist", target_is_directory=True
+    )
+    for pattern in ("dist/**", "**/*.txt", "dist/**/deep.txt"):
+        names = [
+            p.relative_to(linked_tree).as_posix()
+            for p in resolve_paths([pattern], linked_tree).files
+        ]
+        assert all("loop" not in name for name in names), pattern
+        assert "dist/sub/deep.txt" in names, pattern
+    resolved = resolve_paths(["dist/**"], linked_tree)
+    build_zip(resolved, tmp_path / "z.zip")
+    with zipfile.ZipFile(tmp_path / "z.zip") as zf:
+        assert zf.namelist() == ["link", "real.txt", "sub/deep.txt"]
+
+
+def test_a_file_link_reached_through_a_wildcard_is_still_archived(linked_tree: Path) -> None:
+    assert linked_tree / "dist" / "link" in resolve_paths(["dist/l*"], linked_tree).files
+
+
+def test_a_pattern_that_climbs_out_of_its_own_root_is_a_usage_error_at_build_time(
+    tmp_path: Path,
+) -> None:
+    make_tree(tmp_path, {"a/s/x": b"x", "b": b"b"})
+    resolved = resolve_paths(["a/*/../../b"], tmp_path)
+    with pytest.raises(UsageError, match=r"cannot archive .*outside") as caught:
+        build_zip(resolved, tmp_path / "z.zip")
+    assert str(tmp_path / "b") in str(caught.value)
+    assert not (tmp_path / "z.zip").exists()
+
+
+def test_patterns_without_a_common_root_are_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows, `C:\\out\\*` and `D:\\out\\*` share no directory; `commonpath` raises."""
+    make_tree(tmp_path, {"a/x": b"x", "b/y": b"y"})
+
+    def two_drives(_paths: list[str]) -> str:
+        raise ValueError("Paths don't have the same drive")
+
+    monkeypatch.setattr(os.path, "commonpath", two_drives)
+    with pytest.raises(UsageError, match="no common directory"):
+        resolve_paths(["a", "b"], tmp_path)
+
+
+def test_an_empty_directory_with_a_file_below_it_elsewhere_is_not_recorded_twice(
+    tmp_path: Path,
+) -> None:
+    """`empty` holds only directories no archived file lies under, however the two were matched."""
+    make_tree(tmp_path, {"a/keep/f": b"f", "a/other/g.tmp": b"g"}, dirs=("a/void",))
+    resolved = resolve_paths(["a", "!a/**/*.tmp"], tmp_path)
+    assert [p.relative_to(tmp_path).as_posix() for p in resolved.files] == ["a/keep/f"]
+    assert [p.relative_to(tmp_path).as_posix() for p in resolved.empty_dirs] == ["a/void"]

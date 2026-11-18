@@ -53,7 +53,24 @@ def _is_hidden(path: Path, base: Path) -> bool:
     return any(part.startswith(".") for part in parts)
 
 
-def _expand(path: Path, *, include_hidden: bool, base: Path) -> tuple[set[Path], set[Path]]:
+def _crosses_directory_link(path: Path, base: Path) -> bool:
+    """Whether `path`, below `base`, is or lies under a link to a directory. A wildcard must not
+    reach through one: `dist/*` and `**` see what a walk of `dist` sees, on every Python (3.11
+    and 3.12 follow such links under `**`, 3.13 does not), and a link back to an ancestor cannot
+    multiply the tree. The search base itself is exempt: a link the pattern names is walked."""
+    try:
+        parts = path.relative_to(base).parts
+    except ValueError:  # a pattern that climbs out of its search path with `..`
+        return False
+    here = base
+    for part in parts:
+        here = here / part
+        if here.is_symlink() and here.is_dir():
+            return True
+    return False
+
+
+def _expand(path: Path, *, include_hidden: bool) -> tuple[set[Path], set[Path]]:
     """A file is itself; a directory is every file below it plus its empty directories.
 
     Links keep their own names. A link to a file is that file's content under the link's name; a
@@ -69,8 +86,6 @@ def _expand(path: Path, *, include_hidden: bool, base: Path) -> tuple[set[Path],
         if not include_hidden:
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             filenames = [f for f in filenames if not f.startswith(".")]
-        if not include_hidden and _is_hidden(here, base):
-            continue
         filenames = [f for f in filenames if (here / f).is_file()]
         for name in filenames:
             files.add(here / name)
@@ -89,7 +104,9 @@ def _matches(pattern: str, cwd: Path, *, include_hidden: bool) -> tuple[set[Path
         p = _norm(cwd / hit)
         if not include_hidden and _is_hidden(p, base):
             continue
-        f, e = _expand(p, include_hidden=include_hidden, base=base)
+        if _crosses_directory_link(p, base):
+            continue
+        f, e = _expand(p, include_hidden=include_hidden)
         files |= f
         empty |= e
     return files, empty
@@ -112,10 +129,18 @@ def resolve_paths(patterns: Sequence[str], cwd: Path, *, include_hidden: bool = 
         ex_files, ex_empty = _matches(pattern, cwd, include_hidden=include_hidden)
         excluded |= ex_files | ex_empty
     files -= excluded
-    empty = {d for d in empty if d not in excluded and not any(f.is_relative_to(d) for f in files)}
+    occupied = {parent for f in files for parent in f.parents}  # every directory holding a file
+    empty = {d for d in empty if d not in excluded and d not in occupied}
     if not files and not empty:
         return Resolved([], [], cwd)
-    root = Path(os.path.commonpath([str(_search_base(p, cwd)) for p in includes]))
+    bases = [str(_search_base(p, cwd)) for p in includes]
+    try:
+        root = Path(os.path.commonpath(bases))
+    except ValueError as exc:  # two Windows drives
+        raise UsageError(
+            f"the paths share no common directory to root the archive at ({exc}); "
+            "upload them as separate artifacts"
+        ) from exc
     return Resolved(sorted(files), sorted(empty), root)
 
 
@@ -138,7 +163,13 @@ def sha256_file(path: Path) -> str:
 
 def _arcname(path: Path, root: Path) -> str:
     """The name `path` gets in the zip. Refuse here what `safe_extract` would refuse there."""
-    name = path.relative_to(root).as_posix()
+    try:
+        name = path.relative_to(root).as_posix()
+    except ValueError:
+        raise UsageError(
+            f"cannot archive {path}: it lies outside {root}, the directory the patterns "
+            "search (a pattern climbs out of it with `..`)"
+        ) from None
     if "\\" in name or _DRIVE.match(name.split("/", 1)[0]):
         raise UsageError(
             f"cannot archive {path}: extraction refuses the name {name!r} "

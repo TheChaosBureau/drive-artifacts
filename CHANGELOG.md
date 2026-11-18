@@ -6,6 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A link to a directory is no longer followed when a wildcard reaches it (`dist/*`, `**`):
+  wildcards now see what a walk of the directory sees, on every supported Python, and a link
+  back to an ancestor can no longer put many copies of a tree into one artifact. A link that
+  `path` names itself is still walked.
+- A pattern that climbs out of the directory it searches (`a/*/../../b`), and patterns on
+  two Windows drives, are reported as usage errors (exit 2) instead of crashing.
+
 ## [0.1.0] - 2026-11-17
 
 ### Added
