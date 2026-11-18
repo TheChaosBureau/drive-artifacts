@@ -69,5 +69,8 @@ recoverable for 30 days.
 - A token unused for six months stops working. `drive-artifacts login` again.
 - Drive's trash empties itself after 30 days. Pruning never deletes permanently.
 - Your Drive quota is the limit. Personal accounts start at 15 GB.
+- Two jobs that upload the same name in the same run with `overwrite: true` at the same
+  moment both succeed, and the later upload is the one that stays. The earlier job's
+  outputs then point at a file that is in the trash. Give parallel jobs different names.
 
 Read the [privacy policy](privacy.md) for the Drive Artifacts app.
