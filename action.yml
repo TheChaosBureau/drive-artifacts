@@ -71,25 +71,30 @@ runs:
         DA_OVERWRITE: ${{ inputs.overwrite }}
         DA_INCLUDE_HIDDEN: ${{ inputs.include-hidden-files }}
         DA_PRUNE: ${{ inputs.prune }}
+        PYTHONUTF8: "1" # a Windows console is not UTF-8; artifact names may be
       run: |
-        args=(upload --name "$DA_NAME" --path "$DA_PATH"
-              --retention-days "$DA_RETENTION_DAYS"
-              --if-no-files-found "$DA_IF_NO_FILES_FOUND"
-              --compression-level "$DA_COMPRESSION_LEVEL")
+        # `--option=value`, so a value that starts with a dash is never read as an option.
+        args=(upload --name="$DA_NAME" --path="$DA_PATH"
+              --retention-days="$DA_RETENTION_DAYS"
+              --if-no-files-found="$DA_IF_NO_FILES_FOUND"
+              --compression-level="$DA_COMPRESSION_LEVEL")
+        # Workflow-command escaping, so an input value cannot end the line and start a command.
+        esc() { local v=$1; v=${v//'%'/%25}; v=${v//$'\r'/%0D}; v=${v//$'\n'/%0A}; printf '%s' "$v"; }
         # Booleans as actions/upload-artifact reads them (YAML 1.2 core schema); anything else fails.
         case "$DA_OVERWRITE" in
           true|True|TRUE) args+=(--overwrite) ;;
           false|False|FALSE) ;;
-          *) echo "::error::overwrite must be true or false, got '$DA_OVERWRITE'"; exit 2 ;;
+          *) echo "::error::overwrite must be true or false, got '$(esc "$DA_OVERWRITE")'"; exit 2 ;;
         esac
         case "$DA_INCLUDE_HIDDEN" in
           true|True|TRUE) args+=(--include-hidden-files) ;;
           false|False|FALSE) ;;
-          *) echo "::error::include-hidden-files must be true or false, got '$DA_INCLUDE_HIDDEN'"; exit 2 ;;
+          *) echo "::error::include-hidden-files must be true or false, got '$(esc "$DA_INCLUDE_HIDDEN")'"; exit 2 ;;
         esac
         case "$DA_PRUNE" in
           true|True|TRUE) ;;
           false|False|FALSE) args+=(--no-prune) ;;
-          *) echo "::error::prune must be true or false, got '$DA_PRUNE'"; exit 2 ;;
+          *) echo "::error::prune must be true or false, got '$(esc "$DA_PRUNE")'"; exit 2 ;;
         esac
-        uvx --from "$DA_SOURCE" drive-artifacts "${args[@]}"
+        # --no-config: the calling repository's uv.toml must not change how this installs.
+        uvx --no-config --from "$DA_SOURCE" drive-artifacts "${args[@]}"

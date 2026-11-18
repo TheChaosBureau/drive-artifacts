@@ -75,5 +75,8 @@ recoverable for 30 days.
 - A file whose name holds a backslash or starts like a Windows drive (`C:`) cannot be
   uploaded, because extraction would refuse it; and every path must lie inside the
   directories the patterns search (no `a/*/../../b`).
+- Two jobs that upload the same name in the same run with `overwrite: true` at the same
+  moment both succeed, and the later upload is the one that stays. The earlier job's
+  outputs then point at a file that is in the trash. Give parallel jobs different names.
 
 Read the [privacy policy](privacy.md) for the Drive Artifacts app.

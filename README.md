@@ -90,8 +90,8 @@ Outputs: `artifact-id`, `artifact-url`, `artifact-digest` (`sha256:…`), `size`
 
 | input | default | meaning |
 |---|---|---|
-| `name` | all | omit to download every artifact of the run into subdirectories |
-| `path` | `.` | directory to extract into |
+| `name` | all | omit to download every artifact of the run into subdirectories; a run that stored none is a warning, not a failure |
+| `path` | `.` | directory to extract into; a leading `~` is the home directory |
 | `token` | required | the `DRIVE_ARTIFACTS_TOKEN` secret |
 | `run-id` | this run | another run of this repository |
 | `ref` | | latest artifact of `name` for a ref (needs `name`) |
@@ -151,6 +151,9 @@ drive-artifacts logout
 - A file whose name holds a backslash or starts like a Windows drive (`C:`) cannot be
   uploaded, because extraction would refuse it; and every path must lie inside the
   directories the patterns search (no `a/*/../../b`).
+- Two jobs that upload the same name in the same run with `overwrite: true` at the same
+  moment both succeed, and the later upload is the one that stays. The earlier job's
+  outputs then point at a file that is in the trash. Give parallel jobs different names.
 
 ## Bring your own OAuth client
 

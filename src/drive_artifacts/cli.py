@@ -275,12 +275,15 @@ def cmd_download(e: Env) -> int:
     a = e.args
     store = _store(e)
     records = _select_for_download(e, store)
+    if not records and a.name:
+        raise NotFoundError(f"no artifact matches {a.name} for the requested run, ref or commit")
     if not records:
-        raise NotFoundError(
-            f"no artifact matches {a.name or '(any)'} for the requested run, ref or commit"
-        )
+        # As actions/download-artifact does without a name: a run that stored nothing is not
+        # an error, there is just nothing to extract.
+        run_id = a.which_run_id or _ctx(e, require_run=False).run_id
+        e.actions.warning(f"no artifacts found for run {run_id}; nothing was downloaded")
     log.info("downloading %d artifact(s) into %s", len(records), a.path)
-    dest = (e.cwd / a.path).resolve()
+    dest = (e.cwd / Path(a.path).expanduser()).resolve()
     extracted: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="drive-artifacts-") as td:
         for record in records:
@@ -432,7 +435,12 @@ def _default_run_gh(args: list[str], stdin: str) -> int:
     if gh is None:
         raise UsageError("gh is not on PATH; re-run with --print and add the secret by hand")
     # The secret goes in on stdin, never in argv.
-    return subprocess.run([gh, *args], input=stdin, text=True, check=False).returncode  # noqa: S603 - argv list, no shell
+    try:
+        return subprocess.run([gh, *args], input=stdin, text=True, check=False).returncode  # noqa: S603 - argv list, no shell
+    except OSError as exc:
+        raise UsageError(
+            f"could not run gh ({exc}); re-run with --print and add the secret by hand"
+        ) from exc
 
 
 def main(
@@ -475,6 +483,10 @@ def main(
         except DriveArtifactsError as exc:
             actions.error(str(exc))
             return exc.exit_code
+        except BrokenPipeError:
+            # `drive-artifacts list | head -1`: the reader left. Not an error of ours, and
+            # there is nobody to tell; 141 is what a shell reports for a SIGPIPE death.
+            return 141
         except OSError as exc:
             # A full disk, a read-only directory: the environment, not the artifact.
             actions.error(f"filesystem error: {exc}")

@@ -339,7 +339,7 @@ def test_upload_finds_a_file_whose_last_response_was_lost(
     assert fake.files[f.id].content == _blob(2000)
     assert len(fake.live_files()) == 1  # found complete, not uploaded a second time
     assert _content_ranges(fake) == ["bytes 0-1023/2000", "bytes 1024-1999/2000", "bytes */2000"]
-    assert sleeps == [1.0]
+    assert sleeps == []  # the session is asked before any backoff, and it was already complete
 
 
 def test_upload_gives_up_when_chunks_keep_failing(
@@ -768,7 +768,7 @@ def test_download_cut_after_the_last_byte_is_complete(
     assert drive.download_file("f", tmp_path / "a.zip", expected_size=10) == 10
     assert (tmp_path / "a.zip").read_bytes() == data
     assert len(requests) == 1  # nothing left to ask for, so no Range request
-    assert sleeps == [1.0]
+    assert sleeps == []  # and nothing to wait for: the file is complete
 
 
 _fault = st.one_of(
@@ -810,3 +810,262 @@ def test_upload_converges_under_random_faults(
     src.write_bytes(_blob(size))
     f = drive.upload_file(src, name="z", parent=None, app_properties={"k": "v"})
     assert fake.files[f.id].content == _blob(size)
+
+
+# ----- edges from the pre-release reviews ------------------------------------------------------
+
+
+def _stored_but_503(
+    fake: FakeDrive, *, plain_failures: int
+) -> Callable[[httpx.Request], httpx.Response]:
+    """The first `plain_failures` chunk PUTs fail outright. Every later one reaches the server,
+    which stores it, but the answer is lost and the client sees a 503."""
+    seen = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if _chunk_put(request):
+            seen[0] += 1
+            if seen[0] > plain_failures:
+                fake.handler(request)
+            return httpx.Response(503, json={"error": {"errors": [{"reason": "backendError"}]}})
+        return fake.handler(request)
+
+    return handler
+
+
+def test_progress_made_by_the_last_attempt_in_the_budget_is_credited(
+    fake: FakeDrive,
+    tokens: RefreshingTokenSource,
+    settings: Settings,
+    sleeps: list[float],
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "a.zip"
+    src.write_bytes(_blob(2000))
+    # max_attempts is 5: four plain failures, then the fifth PUT is stored although it "failed"
+    drive = _drive_over(_stored_but_503(fake, plain_failures=4), tokens, settings, sleeps)
+    f = drive.upload_file(src, name="a.zip", parent=None, app_properties={})
+    assert fake.files[f.id].content == _blob(2000)
+    assert sleeps == [1.0, 2.0, 4.0, 8.0]  # four real stalls; the stored chunks cost no backoff
+
+
+def test_a_backoff_never_sleeps_past_the_deadline(
+    fake: FakeDrive, tokens: RefreshingTokenSource, settings: Settings
+) -> None:
+    now = [0.0]
+    fake.faults.append(Fault(status=503, method="GET", count=99))
+    patient = _timed_client(fake.handler, tokens, settings, now, deadline_s=10.0)
+    with pytest.raises(DriveError, match="gave up at the 10 s deadline"):
+        patient.get_file("x")
+    assert now[0] == 10.0  # 1 + 2 + 4, then 3 of the next 8: not 15
+
+
+def test_an_upload_backoff_never_sleeps_past_the_deadline(
+    fake: FakeDrive, tokens: RefreshingTokenSource, settings: Settings, tmp_path: Path
+) -> None:
+    src = tmp_path / "a.zip"
+    src.write_bytes(_blob(2000))
+    now = [0.0]
+    patient = _timed_client(_chunks_fail(fake), tokens, settings, now, deadline_s=10.0)
+    with pytest.raises(DriveError, match="upload gave up at the 10 s deadline"):
+        patient.upload_file(src, name="a.zip", parent=None, app_properties={})
+    assert now[0] == 10.0
+
+
+def test_a_failing_offset_query_shares_the_upload_budget(
+    fake: FakeDrive,
+    tokens: RefreshingTokenSource,
+    settings: Settings,
+    sleeps: list[float],
+    tmp_path: Path,
+) -> None:
+    """A stall is one budget of `max_attempts`, not one per offset query inside it."""
+    src = tmp_path / "a.zip"
+    src.write_bytes(_blob(2000))
+    puts = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT":  # chunks and offset queries alike
+            puts[0] += 1
+            return httpx.Response(503, json={"error": {"errors": [{"reason": "backendError"}]}})
+        return fake.handler(request)
+
+    drive = _drive_over(handler, tokens, settings, sleeps)
+    with pytest.raises(DriveError, match="upload gave up after 5 attempts"):
+        drive.upload_file(src, name="a.zip", parent=None, app_properties={})
+    assert puts[0] <= 6  # the chunk, then at most one offset query per attempt
+    assert sleeps == [1.0, 2.0, 4.0, 8.0]
+
+
+def test_a_download_stops_at_the_deadline(
+    tokens: RefreshingTokenSource, settings: Settings, tmp_path: Path
+) -> None:
+    now = [0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, headers={"Content-Length": "10"}, stream=CutStream(_blob(10), 0, request)
+        )
+
+    patient = _timed_client(handler, tokens, settings, now, deadline_s=10.0)
+    with pytest.raises(DriveError, match="download gave up at the 10 s deadline"):
+        patient.download_file("f", tmp_path / "a.zip", expected_size=10)
+    assert now[0] == 10.0
+    assert not (tmp_path / "a.zip").exists()
+
+
+def _answering(response: Callable[[httpx.Request], httpx.Response | None], fake: FakeDrive):  # type: ignore[no-untyped-def]
+    def handler(request: httpx.Request) -> httpx.Response:
+        return response(request) or fake.handler(request)
+
+    return handler
+
+
+def test_a_success_that_is_not_json_is_a_drive_error(
+    fake: FakeDrive, tokens: RefreshingTokenSource, settings: Settings, sleeps: list[float]
+) -> None:
+    """A captive portal or proxy answering 200 with its own page."""
+    portal = lambda _request: httpx.Response(200, text="<html>Sign in to the network</html>")  # noqa: E731
+    drive = _drive_over(_answering(portal, fake), tokens, settings, sleeps)
+    with pytest.raises(DriveError, match="not the JSON"):
+        drive.get_file("x")
+    with pytest.raises(DriveError, match="not the JSON"):
+        drive.list_files("trashed = false")
+    with pytest.raises(DriveError, match="not the JSON"):
+        drive.create_folder("f", parent=None, app_properties={})
+
+
+@pytest.mark.parametrize("body", [["not", "a", "file"], {"kind": "drive#file"}])
+def test_json_that_is_not_a_file_is_a_drive_error(
+    fake: FakeDrive,
+    tokens: RefreshingTokenSource,
+    settings: Settings,
+    sleeps: list[float],
+    body: object,
+) -> None:
+    drive = _drive_over(
+        _answering(lambda _r: httpx.Response(200, json=body), fake), tokens, settings, sleeps
+    )
+    with pytest.raises(DriveError, match="not the JSON"):
+        drive.get_file("x")
+
+
+def test_a_redirect_is_never_written_as_file_content(
+    fake: FakeDrive,
+    tokens: RefreshingTokenSource,
+    settings: Settings,
+    sleeps: list[float],
+    tmp_path: Path,
+) -> None:
+    redirect = lambda _r: httpx.Response(  # noqa: E731
+        302, headers={"Location": "https://example.test/login"}, text="<html>moved</html>"
+    )
+    drive = _drive_over(_answering(redirect, fake), tokens, settings, sleeps)
+    with pytest.raises(DriveError, match="HTTP 302"):
+        drive.download_file("f", tmp_path / "a.zip")
+    assert not (tmp_path / "a.zip").exists()
+    assert list(tmp_path.iterdir()) == []
+    assert sleeps == []
+
+
+@pytest.mark.parametrize("header", ["garbage", "bytes=0-", "bytes=0-x", "bytes=5"])
+def test_a_malformed_range_on_a_308_is_a_drive_error(
+    fake: FakeDrive,
+    tokens: RefreshingTokenSource,
+    settings: Settings,
+    sleeps: list[float],
+    tmp_path: Path,
+    header: str,
+) -> None:
+    src = tmp_path / "a.zip"
+    src.write_bytes(_blob(2000))
+    bad = lambda r: httpx.Response(308, headers={"Range": header}) if _chunk_put(r) else None  # noqa: E731
+    drive = _drive_over(_answering(bad, fake), tokens, settings, sleeps)
+    with pytest.raises(DriveError, match="malformed Range"):
+        drive.upload_file(src, name="a.zip", parent=None, app_properties={})
+
+
+def test_a_malformed_session_location_is_a_drive_error(
+    fake: FakeDrive,
+    tokens: RefreshingTokenSource,
+    settings: Settings,
+    sleeps: list[float],
+    tmp_path: Path,
+) -> None:
+    src = tmp_path / "a.zip"
+    src.write_bytes(_blob(10))
+    seen: list[httpx.Request] = []
+    drive = _drive_over(
+        _opening_with(fake, seen, lambda _real: "https://www.googleapis.com/up\x00load"),
+        tokens,
+        settings,
+        sleeps,
+    )
+    with pytest.raises(DriveError, match="malformed upload session URL"):
+        drive.upload_file(src, name="a.zip", parent=None, app_properties={})
+    assert not any(r.method == "PUT" for r in seen)
+
+
+def _opening_posts(fake: FakeDrive) -> int:
+    return sum(1 for r in fake.requests if r.method == "POST" and "uploadType" in str(r.url))
+
+
+@pytest.mark.parametrize("status", [404, 410])
+def test_an_expired_session_is_reopened_and_the_upload_starts_over(
+    drive: DriveClient, fake: FakeDrive, tmp_path: Path, status: int
+) -> None:
+    """Drive documents "404 or 410" for a session that expired."""
+    src = tmp_path / "a.zip"
+    src.write_bytes(_blob(1500))
+    fake.faults.append(Fault(status=status, reason="notFound", method="PUT", path="upload_id"))
+    f = drive.upload_file(src, name="a.zip", parent=None, app_properties={})
+    assert fake.files[f.id].content == _blob(1500)
+    assert _opening_posts(fake) == 2
+    ranges = _content_ranges(fake)
+    assert ranges[0] == "bytes 0-1023/1500"  # refused: the session was gone
+    assert ranges[1:] == ["bytes 0-1023/1500", "bytes 1024-1499/1500"]  # from the start again
+
+
+def test_an_access_token_that_expires_mid_upload_is_refreshed(
+    fake: FakeDrive,
+    tokens: RefreshingTokenSource,
+    settings: Settings,
+    sleeps: list[float],
+    tmp_path: Path,
+) -> None:
+    """Access tokens last an hour; a long upload meets the expiry between two chunks."""
+    src = tmp_path / "a.zip"
+    src.write_bytes(_blob(3000))
+    chunks = [0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if _chunk_put(request):
+            chunks[0] += 1
+            if chunks[0] == 2:
+                fake.expire_access_tokens()
+        return fake.handler(request)
+
+    drive = _drive_over(handler, tokens, settings, sleeps)
+    f = drive.upload_file(src, name="a.zip", parent=None, app_properties={})
+    assert fake.files[f.id].content == _blob(3000)
+    assert chunks[0] == 4  # three chunks, one of them sent twice: once stale, once fresh
+    assert sleeps == []  # a refresh is not a failure: no backoff
+
+
+@pytest.mark.parametrize("size", [0, -1024])
+def test_chunk_size_must_be_positive(
+    http: httpx.Client, tokens: RefreshingTokenSource, settings: Settings, size: int
+) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        DriveClient(http, tokens, settings, chunk_size=size)
+
+
+def test_list_files_stops_after_max_pages(drive: DriveClient, fake: FakeDrive) -> None:
+    for i in range(5):
+        fake.add_file(f"f{i}", b"x", props={"k": "v"})
+    q = "appProperties has { key='k' and value='v' } and trashed = false"
+    assert len(drive.list_files(q, page_size=2)) == 5
+    before = len(fake.requests)
+    assert len(drive.list_files(q, page_size=2, max_pages=1)) == 2
+    assert len(fake.requests) - before == 1
+    assert len(drive.list_files(q, page_size=2, max_pages=2)) == 4
