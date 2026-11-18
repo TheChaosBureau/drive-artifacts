@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 
-from drive_artifacts.errors import AuthError
+from drive_artifacts.errors import AuthError, UsageError
 from drive_artifacts.oauth import (
     RefreshingTokenSource,
     StoredToken,
@@ -353,3 +353,16 @@ def test_revoke_wraps_undecodable_responses() -> None:
     client = httpx.Client(transport=httpx.MockTransport(_undecodable))
     with pytest.raises(AuthError, match="DecodingError"):
         revoke(client, SETTINGS, "rt-1")
+
+
+def test_a_loopback_port_that_cannot_be_opened_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_port(*_args: object, **_kwargs: object) -> None:
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr("drive_artifacts.oauth.HTTPServer", no_port)
+    opened: list[str] = []
+    with pytest.raises(UsageError, match=r"local port.*Permission denied"):
+        loopback_login(http(FakeDrive()), SETTINGS, opened.append, timeout=1)
+    assert opened == []

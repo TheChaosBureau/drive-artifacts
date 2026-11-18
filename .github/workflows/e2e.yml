@@ -35,9 +35,6 @@ jobs:
       # repository stores nothing as a GitHub Actions artifact, its own action
       # under test included.
       expected-sha256: ${{ steps.expected.outputs.lines }}
-    env:
-      DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
-      DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -54,6 +51,9 @@ jobs:
           { echo 'lines<<EXPECTED_SHA256'; cat expected.sha256; echo 'EXPECTED_SHA256'; } >> "$GITHUB_OUTPUT"
       - id: up
         uses: ./ # zizmor: ignore[self-repository]
+        env: # only for a fork that tests against a client of its own; unset here
+          DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+          DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
         with:
           name: e2e
           path: |
@@ -76,9 +76,6 @@ jobs:
     needs: upload
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
-      DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -89,6 +86,9 @@ jobs:
         run: printf '%s\n' "$EXPECTED" > expected.sha256
       - id: down
         uses: ./download # zizmor: ignore[self-repository]
+        env: # only for a fork that tests against a client of its own; unset here
+          DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+          DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
         with:
           name: e2e
           path: restored
@@ -105,9 +105,6 @@ jobs:
     needs: upload
     runs-on: windows-latest
     timeout-minutes: 30
-    env:
-      DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
-      DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -118,6 +115,9 @@ jobs:
         run: printf '%s\n' "$EXPECTED" > expected.sha256
       - id: down
         uses: ./download # zizmor: ignore[self-repository]
+        env: # only for a fork that tests against a client of its own; unset here
+          DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+          DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
         with:
           name: e2e
           path: restored
@@ -134,9 +134,6 @@ jobs:
     needs: download
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
-      DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -144,6 +141,9 @@ jobs:
       # This run's own ref, not a fixed main: a manual dispatch from a branch uploads under
       # that branch's ref, and its newest artifact must be the one this run just stored.
       - uses: ./download # zizmor: ignore[self-repository]
+        env: # only for a fork that tests against a client of its own; unset here
+          DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+          DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
         with:
           name: e2e
           ref: ${{ github.ref }}
