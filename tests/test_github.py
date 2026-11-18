@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import io
+import os
 from pathlib import Path
 
 import pytest
@@ -101,3 +102,67 @@ def test_annotation_newlines_are_encoded() -> None:
     err = io.StringIO()
     Actions(ENV, err).error("two\nlines")
     assert err.getvalue() == "::error::two%0Alines\n"
+
+
+def test_mask_encodes_the_value_like_any_command_data() -> None:
+    """The runner unescapes %25, %0D and %0A in command data, so a raw `%0A` in a secret would
+    register a different string as the mask."""
+    err = io.StringIO()
+    Actions(ENV, err).mask("a%0Ab\r\nc")
+    assert err.getvalue() == "::add-mask::a%250Ab%0D%0Ac\n"
+
+
+def test_mask_of_an_empty_value_writes_nothing() -> None:
+    err = io.StringIO()
+    Actions(ENV, err).mask("")
+    assert err.getvalue() == ""
+
+
+def test_an_output_with_a_carriage_return_uses_the_heredoc_form(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    Actions({**ENV, "GITHUB_OUTPUT": str(out)}, io.StringIO()).output("x", "a\rb")
+    # Bytes, not text: reading as text would fold the lone carriage return into a line end.
+    # The file is written in text mode, so line ends are the platform's (CRLF on Windows).
+    text = out.read_bytes().decode()
+    eol = os.linesep
+    name, delimiter = text.split(eol, 1)[0].split("<<")
+    assert name == "x"
+    assert text == f"x<<{delimiter}{eol}a\rb{eol}{delimiter}{eol}"
+
+
+def test_a_multi_line_output_is_closed_by_its_own_delimiter(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    Actions({**ENV, "GITHUB_OUTPUT": str(out)}, io.StringIO()).output("multi", "line1\nline2")
+    lines = out.read_text().split("\n")
+    delimiter = lines[0].removeprefix("multi<<")
+    assert delimiter.startswith("da_")
+    assert len(delimiter) == 19
+    assert lines == [f"multi<<{delimiter}", "line1", "line2", delimiter, ""]
+
+
+def test_annotations_encode_percent_and_carriage_return() -> None:
+    err = io.StringIO()
+    Actions(ENV, err).warning("100%\r\ndone")
+    assert err.getvalue() == "::warning::100%25%0D%0Adone\n"
+
+
+def test_in_actions_without_an_output_file_outputs_are_dropped_quietly() -> None:
+    err = io.StringIO()
+    a = Actions(ENV, err)  # GITHUB_ACTIONS=true but no GITHUB_OUTPUT or GITHUB_STEP_SUMMARY
+    a.output("x", "y")
+    a.summary("z")
+    a.notice("still annotates")
+    assert err.getvalue() == "::notice::still annotates\n"
+
+
+def test_the_usage_error_names_only_the_missing_option() -> None:
+    with pytest.raises(UsageError) as only_repo:
+        read_run_context({}, repo_id="1")
+    assert "--repo" in str(only_repo.value)
+    assert "--repo-id" not in str(only_repo.value)
+    with pytest.raises(UsageError) as only_id:
+        read_run_context({}, repo="o/r")
+    assert "--repo-id" in str(only_id.value)
+    assert "--repo " not in str(only_id.value) + " "
+    with pytest.raises(UsageError, match="--repo-id and --repo"):
+        read_run_context({})

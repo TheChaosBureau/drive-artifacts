@@ -79,7 +79,7 @@ recoverable for 30 days.
 | `if-no-files-found` | `warn` | `warn`, `error` or `ignore` |
 | `compression-level` | `6` | 0 (store) .. 9 |
 | `overwrite` | `false` | replace an artifact of the same name in this run |
-| `include-hidden-files` | `false` | include dot-files and dot-directories |
+| `include-hidden-files` | `false` | include dot-files and dot-directories; a hidden directory that `path` names itself (`.cache/out/*`) is always searched |
 | `root` | `GitHub Artifacts` | the folder the app owns |
 | `prune` | `true` | trash this repository's expired artifacts after the upload; a failure here is a warning, the upload still succeeds |
 | `source` | `drive-artifacts==<this release>` | the requirement `uvx` installs; leave it alone |
@@ -90,8 +90,8 @@ Outputs: `artifact-id`, `artifact-url`, `artifact-digest` (`sha256:…`), `size`
 
 | input | default | meaning |
 |---|---|---|
-| `name` | all | omit to download every artifact of the run into subdirectories |
-| `path` | `.` | directory to extract into |
+| `name` | all | omit to download every artifact of the run into subdirectories; a run that stored none is a warning, not a failure |
+| `path` | `.` | directory to extract into; a leading `~` is the home directory |
 | `token` | required | the `DRIVE_ARTIFACTS_TOKEN` secret |
 | `run-id` | this run | another run of this repository |
 | `ref` | | latest artifact of `name` for a ref (needs `name`) |
@@ -145,6 +145,15 @@ drive-artifacts logout
 - A token unused for six months stops working. `drive-artifacts login` again.
 - Drive's trash empties itself after 30 days. Pruning never deletes permanently.
 - Your Drive quota is the limit. Personal accounts start at 15 GB.
+- Links: a link to a file is stored as that file under the link's name. A link to a
+  directory is followed only when `path` names it; wildcards and directory walks do not go
+  through one. A broken link is left out.
+- A file whose name holds a backslash or starts like a Windows drive (`C:`) cannot be
+  uploaded, because extraction would refuse it; and every path must lie inside the
+  directories the patterns search (no `a/*/../../b`).
+- Two jobs that upload the same name in the same run with `overwrite: true` at the same
+  moment both succeed, and the later upload is the one that stays. The earlier job's
+  outputs then point at a file that is in the trash. Give parallel jobs different names.
 
 ## Bring your own OAuth client
 
