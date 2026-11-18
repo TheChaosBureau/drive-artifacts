@@ -6,20 +6,6 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- `login`: a browser connection that opens and sends nothing (a preconnect) no longer keeps
-  the real redirect waiting until the login times out; each connection may stay silent for
-  at most 5 seconds.
-- `login`: the page shown in the browser now says when the login failed (Google reported an
-  error, or the response carried no code) instead of always "you can close this tab", and a
-  redirect that is not a GET is named in the timeout message.
-- Google's token endpoint answering 429 is retried like a 5xx.
-- In Actions, a masked value is encoded like any other command data, so a value containing
-  `%` or a line break is masked as itself; an output value containing a lone carriage
-  return is written in the multi-line form.
-- The "not inside GitHub Actions" message names only the option that is missing.
-
 ## [0.1.0] - 2026-11-17
 
 ### Added
