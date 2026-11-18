@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Upload: a chunk the server stored although its answer was lost counts as progress even on
+  the last attempt of the retry budget; a stall draws on one budget however many offset
+  queries it takes; an upload session answered with 410 is reopened like one answered 404.
+- Retries never sleep past the deadline, and downloads honour the deadline too.
+- A download whose connection breaks after the last byte no longer waits once before
+  finishing.
+- A successful answer that is not the expected JSON (a proxy's or captive portal's page), a
+  redirect, a malformed `Range` on an upload chunk and a malformed upload session URL are
+  reported as Drive errors (exit 5). A redirect's body is never written as file content.
+- A chunk size of zero or less is refused.
+
 ## [0.1.0] - 2026-11-17
 
 ### Added
