@@ -32,17 +32,27 @@ def _handler_class(fake: FakeDrive) -> type[BaseHTTPRequestHandler]:
             with contextlib.suppress(OSError):
                 self.connection.shutdown(socket.SHUT_RDWR)
 
+        def _discard_chunked_body(self) -> None:
+            while True:
+                size = int(self.rfile.readline().split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    while self.rfile.readline().strip():  # trailers, up to the blank line
+                        pass
+                    return
+                self.rfile.read(size + 2)  # the chunk and its CRLF
+
         def _serve(self) -> None:
             if self.headers.get("Transfer-Encoding"):
                 # Bodies are read by Content-Length only. A chunked one would arrive empty and
-                # be acted on; refuse it where the mistake is visible.
+                # be acted on; refuse it where the mistake is visible. The body is read off the
+                # socket first: closing on unread bytes resets the connection on Windows, and
+                # the client would see a transport error instead of this answer.
+                self._discard_chunked_body()
                 message = b"this test server reads bodies by Content-Length only"
                 self.send_response(411)
                 self.send_header("Content-Length", str(len(message)))
-                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(message)
-                self.close_connection = True
                 return
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
