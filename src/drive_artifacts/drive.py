@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import random
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -108,7 +109,42 @@ def _reason(response: httpx.Response) -> str:
 def _received(response: httpx.Response) -> int:
     """How many bytes a resumable session holds, from a 308's `Range: bytes=0-N` (absent: none)."""
     rng = response.headers.get("Range")
-    return int(rng.split("-")[1]) + 1 if rng else 0
+    if not rng:
+        return 0
+    match = re.fullmatch(r"bytes=0-(\d+)", rng.strip())
+    if match is None:
+        raise DriveError(f"Drive answered an upload chunk with a malformed Range header ({rng!r})")
+    return int(match.group(1)) + 1
+
+
+def _json_file(response: httpx.Response) -> dict[str, object]:
+    """The JSON object a successful metadata call must answer with. A proxy or a captive
+    portal answers 200 with a page of its own; that is an error, never a file."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        # An upload session's URL carries its id in the query: a credential, so never echoed.
+        where = f"{response.request.method} {response.request.url.copy_with(query=None)}"
+        raise DriveError(
+            f"Drive answered {where} with HTTP {response.status_code} but not the JSON it "
+            "should have sent; a proxy or a sign-in page may be in the way",
+            status=response.status_code,
+        )
+    return body
+
+
+def _file(response: httpx.Response) -> DriveFile:
+    body = _json_file(response)
+    if "id" not in body:
+        where = f"{response.request.method} {response.request.url.copy_with(query=None)}"
+        raise DriveError(
+            f"Drive answered {where} with HTTP {response.status_code} but not the JSON it "
+            "should have sent (no file id)",
+            status=response.status_code,
+        )
+    return DriveFile.from_json(body)
 
 
 def _size_of(path: Path) -> int:
@@ -128,6 +164,8 @@ class DriveClient:
         rng: Callable[[], float] = random.random,
         chunk_size: int = 8 * 1024 * 1024,
     ) -> None:
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
         if chunk_size % (256 * 1024) and chunk_size >= 256 * 1024:
             raise ValueError("chunk_size must be a multiple of 256 KiB")
         self._http = http
@@ -141,9 +179,11 @@ class DriveClient:
         self._chunk = chunk_size
 
     # ----- transport with retries ---------------------------------------------
-    def _backoff(self, attempt: int) -> None:
+    def _backoff(self, attempt: int, start: float) -> None:
+        """Full-jitter exponential backoff that never sleeps past the deadline counted from `start`."""
         delay = min(self._policy.cap_s, self._policy.base_s * 2 ** (attempt - 1)) * self._rng()
-        self._sleep(delay)
+        left = self._policy.deadline_s - (self._clock() - start)
+        self._sleep(max(0.0, min(delay, left)))
 
     def _give_up_if_spent(
         self, what: str, attempt: int, start: float, detail: str, *, status: int, reason: str
@@ -153,7 +193,7 @@ class DriveClient:
             raise DriveError(
                 f"{what} after {attempt} attempts: {detail}", status=status, reason=reason
             )
-        if self._clock() - start > self._policy.deadline_s:
+        if self._clock() - start >= self._policy.deadline_s:
             raise DriveError(
                 f"{what} at the {self._policy.deadline_s:g} s deadline: {detail}",
                 status=status,
@@ -181,7 +221,8 @@ class DriveClient:
             response = self._http.send(request, stream=stream)
         except httpx.TransportError as exc:
             raise _Transient(f"transport error: {exc}") from exc
-        if response.status_code < 400 or response.status_code in allow:
+        # 3xx too is a failure: httpx follows no redirects, and a redirect's body is not a file.
+        if response.status_code < 300 or response.status_code in allow:
             return response
         if stream:
             try:
@@ -197,7 +238,7 @@ class DriveClient:
             raise _Unauthorized(reason)
         # An upload session's URL carries its id in the query: a credential, so never echoed.
         where = f"{method} {httpx.URL(url).copy_with(query=None)}"
-        if response.status_code == 404:
+        if response.status_code in (404, 410):  # 410: what an expired upload session may answer
             raise NotFoundError(f"Drive has no such item ({where})")
         if response.status_code in RETRYABLE_STATUS or (
             response.status_code == 403 and reason in RATE_LIMIT_REASONS
@@ -254,7 +295,7 @@ class DriveClient:
                 self._give_up_if_spent(
                     "gave up", attempt, start, str(exc), status=exc.status, reason=exc.reason
                 )
-                self._backoff(attempt)
+                self._backoff(attempt, start)
 
     # ----- metadata calls -----------------------------------------------------
     def create_folder(
@@ -268,7 +309,7 @@ class DriveClient:
         if parent:
             body["parents"] = [parent]
         response = self._request("POST", f"{self._api}/files", params={"fields": FIELDS}, json=body)
-        return DriveFile.from_json(response.json())
+        return _file(response)
 
     def list_files(
         self,
@@ -293,16 +334,19 @@ class DriveClient:
                 params["orderBy"] = order_by
             if token:
                 params["pageToken"] = token
-            body = self._request("GET", f"{self._api}/files", params=params).json()
-            files.extend(DriveFile.from_json(f) for f in body.get("files", []))
-            token = body.get("nextPageToken")
+            body = _json_file(self._request("GET", f"{self._api}/files", params=params))
+            listed = body.get("files", [])
+            files.extend(
+                DriveFile.from_json(f) for f in (listed if isinstance(listed, list) else [])
+            )
+            token = str(body["nextPageToken"]) if body.get("nextPageToken") else None
             pages += 1
             if not token or (max_pages is not None and pages >= max_pages):
                 return files
 
     def get_file(self, file_id: str) -> DriveFile:
         response = self._request("GET", f"{self._api}/files/{file_id}", params={"fields": FIELDS})
-        return DriveFile.from_json(response.json())
+        return _file(response)
 
     def trash(self, file_id: str) -> None:
         self._request(
@@ -352,7 +396,10 @@ class DriveClient:
             raise DriveError("Drive opened no upload session")
         base = httpx.URL(self._upload)
         # An absolute Location replaces the base; a relative one resolves against it.
-        session = base.join(location)
+        try:
+            session = base.join(location)
+        except httpx.InvalidURL as exc:
+            raise DriveError(f"Drive answered with a malformed upload session URL ({exc})") from exc
         if (session.scheme, session.host, session.port) != (base.scheme, base.host, base.port):
             raise DriveError(
                 "upload session URL points at an unexpected host "
@@ -362,11 +409,17 @@ class DriveClient:
         return str(session)
 
     def _session_offset(self, session: str, total: int) -> tuple[int, DriveFile | None]:
+        """One attempt at asking the session how much it holds. Raises `_Transient` like a chunk
+        does: the caller owns the one retry budget of a stall."""
         response = self._request(
-            "PUT", session, headers={"Content-Range": f"bytes */{total}"}, allow=frozenset({308})
+            "PUT",
+            session,
+            headers={"Content-Range": f"bytes */{total}"},
+            allow=frozenset({308}),
+            retry=False,
         )
         if response.status_code in (200, 201):
-            return total, DriveFile.from_json(response.json())
+            return total, _file(response)
         return _received(response), None
 
     def _send_chunks(self, session: str, path: Path, total: int, mime: str) -> DriveFile:
@@ -381,6 +434,7 @@ class DriveClient:
                 chunk = fh.read(self._chunk)
                 end = offset + len(chunk) - 1
                 content_range = f"bytes {offset}-{end}/{total}" if chunk else f"bytes */{total}"
+                known = True  # whether `reached` is what the server said it holds
                 try:
                     response = self._request(
                         "PUT",
@@ -391,34 +445,49 @@ class DriveClient:
                         retry=False,
                     )
                 except _Transient as exc:
-                    attempt += 1
-                    self._give_up_if_spent(
-                        "upload gave up",
-                        attempt,
-                        start,
-                        str(exc),
-                        status=exc.status,
-                        reason=exc.reason,
-                    )
-                    self._backoff(attempt)
-                    reached, done = self._session_offset(session, total)
-                    if done is not None:
-                        return done
+                    failure, reached = exc, offset
+                    known = False
                 else:
                     if response.status_code in (200, 201):
-                        return DriveFile.from_json(response.json())
+                        return _file(response)
                     reached = _received(response)  # a 308: what the server holds now
-                    if reached <= offset:  # it received fewer bytes than we sent: a failure too
-                        attempt += 1
-                        self._give_up_if_spent(
-                            "upload is not making progress",
-                            attempt,
-                            start,
-                            f"the server still holds {reached} bytes",
-                            status=308,
-                            reason="noProgress",
-                        )
-                        self._backoff(attempt)
+                    failure = _Transient(
+                        f"the server still holds {reached} bytes", 308, "noProgress"
+                    )
+                # Until the server is known to hold more than before, this is a stall: every
+                # failed chunk and every failed offset query in it draws on one budget. The
+                # offset is asked for before the failure is counted, so a chunk the server
+                # stored although its answer was lost is progress, not a failure. A chunk is
+                # sent again only from an offset the server confirmed.
+                while reached <= offset:
+                    if not known:
+                        try:
+                            reached, done = self._session_offset(session, total)
+                        except _Transient as exc:
+                            failure = exc
+                        else:
+                            if done is not None:
+                                return done
+                            known = True
+                            if reached > offset:
+                                break
+                    attempt += 1
+                    what = (
+                        "upload gave up"
+                        if failure.status != 308
+                        else "upload is not making progress"
+                    )
+                    self._give_up_if_spent(
+                        what,
+                        attempt,
+                        start,
+                        str(failure),
+                        status=failure.status,
+                        reason=failure.reason,
+                    )
+                    self._backoff(attempt, start)
+                    if known:
+                        break  # the offset is confirmed and unchanged: send the chunk again
                 if reached > offset:
                     attempt, start = 0, self._clock()
                 offset = reached
@@ -430,6 +499,7 @@ class DriveClient:
         part = dest.with_name(dest.name + ".part")
         part.unlink(missing_ok=True)
         attempt = 0  # consecutive passes that broke without bringing a byte
+        start = self._clock()  # of that run of fruitless passes
         url = f"{self._api}/files/{file_id}"
         try:
             while True:
@@ -459,14 +529,17 @@ class DriveClient:
                         for data in response.iter_bytes():
                             fh.write(data)
                 except httpx.TransportError as exc:
-                    if _size_of(part) > offset:
-                        attempt = 0  # it broke, but only after bringing new bytes: progress
+                    held = _size_of(part)
+                    if expected_size is not None and held >= expected_size:
+                        continue  # it broke after the last byte: complete, nothing to wait for
+                    if held > offset:
+                        # it broke, but only after bringing new bytes: progress
+                        attempt, start = 0, self._clock()
                     attempt += 1
-                    if attempt >= self._policy.max_attempts:
-                        raise DriveError(
-                            f"download gave up after {attempt} attempts: {exc}"
-                        ) from exc
-                    self._backoff(attempt)
+                    self._give_up_if_spent(
+                        "download gave up", attempt, start, str(exc), status=0, reason=""
+                    )
+                    self._backoff(attempt, start)
                     continue
                 finally:
                     response.close()
