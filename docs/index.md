@@ -1,8 +1,5 @@
 # drive-artifacts
 
-> **Not released yet.** Version 0.1.0 is being prepared: the package is not on PyPI and
-> the `v0` tag does not exist, so the steps below do not work until the first release.
-
 ## Three steps
 
 1. Install the CLI and log in once, at a machine with a browser:
