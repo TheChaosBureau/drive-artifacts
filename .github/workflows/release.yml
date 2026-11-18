@@ -53,10 +53,19 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           version="${TAG#v}"
-          awk -v v="$version" '/^## \[/{p = index($0, "[" v "]") > 0} p' CHANGELOG.md > notes.md
+          # This version's section: from its heading to the next one, without the link
+          # definitions that end the file.
+          awk -v v="$version" '/^## \[/{p = index($0, "[" v "]") > 0} /^\[[^]]+\]: /{p = 0} p' CHANGELOG.md > notes.md
           # A re-run of this job must not fail on a release that already exists.
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md
           major="v${version%%.*}"
+          # `uses: ...@v0` resolves to the major tag, so it only ever moves forward: a re-run
+          # of an older release must not take every caller back to it.
+          newest=$(gh api "repos/$REPO/git/matching-refs/tags/$major." --jq '.[].ref' | sed 's#^refs/tags/##' | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -n 1)
+          if [ -n "$newest" ] && [ "$newest" != "$TAG" ]; then
+            echo "::notice::$major stays at $newest; $TAG is not the newest release of its major"
+            exit 0
+          fi
           # Singular `git/ref/...` is an exact match. The plural `git/refs/tags/$major` matches by
           # prefix (`v0` finds `v0.1.0`), so it would report a missing major tag as present and
           # the PATCH below would then fail. Do not "fix" this back to the plural form.

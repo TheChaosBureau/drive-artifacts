@@ -8,7 +8,7 @@ from hypothesis import HealthCheck, given
 from hypothesis import settings as h_settings
 from hypothesis import strategies as st
 
-from drive_artifacts.drive import DriveClient, DriveFile, RetryPolicy
+from drive_artifacts.drive import DEFAULT_CHUNK_SIZE, DriveClient, DriveFile, RetryPolicy
 from drive_artifacts.errors import DriveError, NotFoundError
 from drive_artifacts.model import FOLDER_MIME
 from drive_artifacts.oauth import RefreshingTokenSource, StoredToken
@@ -775,6 +775,8 @@ _fault = st.one_of(
     st.just(Fault(status=503, method="PUT", path="upload_id")),
     st.just(Fault(status=429, reason="rateLimitExceeded", method="PUT", path="upload_id")),
     st.just(Fault(drop=True, method="PUT", path="upload_id")),
+    # the chunk (or the offset query) was processed, but its answer never arrived
+    st.just(Fault(drop_after=True, method="PUT", path="upload_id")),
     st.integers(min_value=0, max_value=1023).map(
         lambda n: Fault(method="PUT", path="upload_id", truncate_to=n)
     ),
@@ -810,6 +812,12 @@ def test_upload_converges_under_random_faults(
     src.write_bytes(_blob(size))
     f = drive.upload_file(src, name="z", parent=None, app_properties={"k": "v"})
     assert fake.files[f.id].content == _blob(size)
+    assert [live.id for live in fake.live_files()] == [f.id]  # stored once, whatever was lost
+
+
+def test_the_default_chunk_size_is_eight_mebibytes() -> None:
+    """The subprocess test builds a file just over one chunk from this number, as a literal."""
+    assert DEFAULT_CHUNK_SIZE == 8 * 1024 * 1024
 
 
 # ----- edges from the pre-release reviews ------------------------------------------------------
