@@ -26,6 +26,8 @@ DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024  # of a resumable upload; a multiple of 256
 
 @dataclass(frozen=True, slots=True)
 class DriveFile:
+    """The fields of a Drive file resource that this package reads."""
+
     id: str
     name: str
     mime_type: str
@@ -39,6 +41,8 @@ class DriveFile:
 
     @classmethod
     def from_json(cls, data: Mapping[str, object]) -> DriveFile:
+        """Build from a Drive file resource. Absent fields become empty values; an absent size is
+        `None`."""
         parents = data.get("parents")
         props = data.get("appProperties")
         size = data.get("size")
@@ -58,6 +62,7 @@ class DriveFile:
         )
 
     def as_mapping(self) -> dict[str, object]:
+        """Back to the shape of a Drive file resource, as `ArtifactRecord.from_drive` reads it."""
         return {
             "id": self.id,
             "name": self.name,
@@ -71,6 +76,9 @@ class DriveFile:
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
+    """How long to keep trying: failed attempts and seconds since the last progress, and the base
+    and cap of the backoff."""
+
     max_attempts: int = 10
     deadline_s: float = 900.0
     base_s: float = 1.0
@@ -153,6 +161,8 @@ def _size_of(path: Path) -> int:
 
 
 class DriveClient:
+    """The Drive calls this package makes, with retries, resumable uploads and ranged downloads."""
+
     def __init__(
         self,
         http: httpx.Client,
@@ -302,6 +312,8 @@ class DriveClient:
     def create_folder(
         self, name: str, *, parent: str | None, app_properties: Mapping[str, str]
     ) -> DriveFile:
+        """Create a folder that carries `app_properties`, under `parent` or at the top of the
+        Drive."""
         body: dict[str, object] = {
             "name": name,
             "mimeType": FOLDER_MIME,
@@ -346,10 +358,12 @@ class DriveClient:
                 return files
 
     def get_file(self, file_id: str) -> DriveFile:
+        """One file's metadata. Raises `NotFoundError` when Drive has no such file."""
         response = self._request("GET", f"{self._api}/files/{file_id}", params={"fields": FIELDS})
         return _file(response)
 
     def trash(self, file_id: str) -> None:
+        """Move a file or folder to the trash, where Drive keeps it for 30 days."""
         self._request(
             "PATCH", f"{self._api}/files/{file_id}", params={"fields": "id"}, json={"trashed": True}
         )
@@ -364,6 +378,8 @@ class DriveClient:
         app_properties: Mapping[str, str],
         mime: str = ZIP_MIME,
     ) -> DriveFile:
+        """Upload `path` in resumable chunks and return the stored file. A session that expired
+        is reopened once."""
         total = path.stat().st_size
         meta: dict[str, object] = {
             "name": name,

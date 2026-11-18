@@ -40,6 +40,8 @@ class StoredToken:
 
     @classmethod
     def parse(cls, text: str) -> StoredToken:
+        """Parse the secret's JSON. Raises `AuthError` saying what is wrong and what to do about
+        it."""
         try:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -52,6 +54,7 @@ class StoredToken:
         return cls(refresh_token=refresh, client_id=client)
 
     def dumps(self) -> str:
+        """The JSON that goes into the secret, with a stable key order."""
         return json.dumps(
             {"client_id": self.client_id, "refresh_token": self.refresh_token, "v": self.v},
             sort_keys=True,
@@ -59,7 +62,11 @@ class StoredToken:
 
 
 class TokenSource(Protocol):
-    def access_token(self, *, force_refresh: bool = False) -> str: ...
+    """Anything that can hand out a current access token."""
+
+    def access_token(self, *, force_refresh: bool = False) -> str:
+        """A valid access token; `force_refresh` discards a cached one first."""
+        ...
 
 
 class RefreshingTokenSource:
@@ -90,6 +97,8 @@ class RefreshingTokenSource:
         self._expires_at = 0.0
 
     def access_token(self, *, force_refresh: bool = False) -> str:
+        """A valid access token: the cached one until it nears expiry, or a fresh one when
+        `force_refresh` is set."""
         if (
             not force_refresh
             and self._token
@@ -155,12 +164,15 @@ def _token_response(response: httpx.Response, *, invalid_grant: str) -> dict[str
 
 
 def pkce_pair() -> tuple[str, str]:
+    """A PKCE verifier and its S256 challenge."""
     verifier = secrets.token_urlsafe(64)  # 86 characters, inside PKCE's 43..128
     digest = hashlib.sha256(verifier.encode()).digest()
     return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
 
 def build_auth_url(settings: Settings, *, redirect_uri: str, state: str, challenge: str) -> str:
+    """Google's consent URL for the loopback flow: offline access, the `drive.file` scope only,
+    PKCE."""
     params = {
         "client_id": settings.client_id,
         "redirect_uri": redirect_uri,
@@ -178,6 +190,8 @@ def build_auth_url(settings: Settings, *, redirect_uri: str, state: str, challen
 def exchange_code(
     http: httpx.Client, settings: Settings, *, code: str, verifier: str, redirect_uri: str
 ) -> StoredToken:
+    """Trade the authorization code for a refresh token. Raises `AuthError` when Google refuses
+    the code or sends no refresh token."""
     body = _token_request(
         http,
         settings,

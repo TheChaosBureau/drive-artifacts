@@ -13,6 +13,7 @@ from drive_artifacts.model import Repo, RunContext
 
 
 def in_actions(env: Mapping[str, str]) -> bool:
+    """Whether the process runs inside a GitHub Actions job."""
     return env.get("GITHUB_ACTIONS") == "true"
 
 
@@ -72,6 +73,7 @@ class Actions:
         self._err = stderr
 
     def output(self, name: str, value: str) -> None:
+        """Set a step output. A value with a line break is written in the multi-line form."""
         if self._output is None:
             return
         self._output.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +86,7 @@ class Actions:
                 fh.write(f"{name}={value}\n")
 
     def summary(self, markdown: str) -> None:
+        """Append Markdown to the step summary."""
         if self._summary is None:
             return
         self._summary.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +94,7 @@ class Actions:
             fh.write(markdown.rstrip("\n") + "\n")
 
     def mask(self, value: str) -> None:
+        """Ask the runner to mask `value` in the logs from here on."""
         if self._active and value:
             self._err.write(f"::add-mask::{_encode(value)}\n")
 
@@ -101,10 +105,13 @@ class Actions:
             self._err.write(f"{level}: {message}\n")
 
     def error(self, message: str) -> None:
+        """An error annotation; outside Actions, a plain `error:` line."""
         self._annotate("error", message)
 
     def warning(self, message: str) -> None:
+        """A warning annotation; outside Actions, a plain `warning:` line."""
         self._annotate("warning", message)
 
     def notice(self, message: str) -> None:
+        """A notice annotation; outside Actions, a plain `notice:` line."""
         self._annotate("notice", message)

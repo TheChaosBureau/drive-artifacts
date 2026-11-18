@@ -31,6 +31,7 @@ class Settings:
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
+        """Read every `DRIVE_ARTIFACTS_*` variable; an empty one counts as unset."""
         api = (env.get("DRIVE_ARTIFACTS_API_BASE") or GOOGLE_API).rstrip("/")
         oauth = env.get("DRIVE_ARTIFACTS_OAUTH_BASE")
         if not oauth:

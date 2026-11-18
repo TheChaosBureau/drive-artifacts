@@ -51,6 +51,9 @@ def _oldest(files: list[DriveFile]) -> DriveFile | None:
 
 
 class ArtifactStore:
+    """Artifacts in Drive: one root folder, one folder per repository, one zip per artifact,
+    identity in `appProperties`."""
+
     def __init__(
         self, drive: DriveClient, *, root_name: str, today: Callable[[], date] = _utc_today
     ) -> None:
@@ -75,6 +78,7 @@ class ArtifactStore:
         return winner
 
     def root_folder(self, *, create: bool) -> DriveFile | None:
+        """The root folder; created when it is missing and `create` is true, otherwise `None`."""
         q = query(
             prop("da.kind", "root"),
             f"mimeType = '{FOLDER_MIME}'",
@@ -92,6 +96,8 @@ class ArtifactStore:
         return self._folder(q, maker)
 
     def repo_folder(self, repo: Repo, *, create: bool) -> DriveFile | None:
+        """The repository's folder under the root; created when it is missing and `create` is
+        true, otherwise `None`."""
         root = self.root_folder(create=create)
         if root is None:
             return None
@@ -138,6 +144,11 @@ class ArtifactStore:
         retention_days: int,
         overwrite: bool = False,
     ) -> ArtifactRecord:
+        """Upload a zip as the artifact `name` of this run and return its record.
+
+        An existing artifact of that name raises `ConflictError` unless `overwrite` is set. An
+        upload whose size Drive records differently is trashed and raises `DriveError`.
+        """
         name = validate_artifact_name(name)
         validate_retention_days(retention_days)
         key = ArtifactKey(ctx.repo.id, ctx.run_id, ctx.run_attempt, name)
@@ -209,6 +220,7 @@ class ArtifactStore:
         )
 
     def find(self, key: ArtifactKey) -> ArtifactRecord | None:
+        """The newest live record for a key, or `None`."""
         records = self._key_records(key)
         # the last upload wins; modifiedTime also moves on a trash/untrash, createdTime never does
         return max(records, key=lambda r: (r.created_time, r.file_id)) if records else None
@@ -216,12 +228,15 @@ class ArtifactStore:
     def list_run(
         self, repo_id: str, run_id: str, *, run_attempt: str | None = None
     ) -> list[ArtifactRecord]:
+        """A run's artifacts, by name and then upload time; every attempt unless `run_attempt` is
+        given."""
         terms = [prop("da.repo", repo_id), prop("da.run", run_id)]
         if run_attempt is not None:
             terms.append(prop("da.attempt", run_attempt))
         return sorted(self._records(*terms), key=lambda r: (r.key.name, r.created_time))
 
     def list_repo(self, repo_id: str, *, ref: str | None = None) -> list[ArtifactRecord]:
+        """Every artifact of the repository, newest first, optionally for one ref."""
         terms = [prop("da.repo", repo_id)]
         if ref is not None:
             # the same mapping artifact_properties applied on upload
@@ -231,6 +246,7 @@ class ArtifactStore:
     def latest(
         self, repo_id: str, name: str, *, ref: str | None = None, commit: str | None = None
     ) -> ArtifactRecord | None:
+        """The newest artifact of that name in the repository, optionally for one ref or commit."""
         terms = [prop("da.repo", repo_id), prop("da.name", name)]
         if ref is not None:
             # the same mapping artifact_properties applied on upload
@@ -242,6 +258,8 @@ class ArtifactStore:
         return records[0] if records else None
 
     def fetch(self, record: ArtifactRecord, dest_zip: Path) -> None:
+        """Download a record's zip to `dest_zip` and verify its digest. A mismatch deletes the
+        file and raises `IntegrityError`."""
         self._drive.download_file(record.file_id, dest_zip, expected_size=record.size)
         actual = sha256_file(dest_zip)
         if actual != record.sha256:
@@ -252,6 +270,8 @@ class ArtifactStore:
             )
 
     def prune(self, repo_id: str, *, dry_run: bool = False) -> list[ArtifactRecord]:
+        """Trash the repository's artifacts whose expiry date has passed, or only find them with
+        `dry_run`; return them."""
         today = self._today()
         expired = [r for r in self._records(prop("da.repo", repo_id)) if r.expires < today]
         if not dry_run:
