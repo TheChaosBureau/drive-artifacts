@@ -42,6 +42,9 @@ log = logging.getLogger("drive_artifacts")
 
 @dataclass(slots=True)
 class Env:
+    """Everything one command needs: arguments, environment, settings, streams, and the browser
+    and gh runners (injected, so tests can replace them)."""
+
     args: argparse.Namespace
     env: Mapping[str, str]
     settings: Settings
@@ -188,6 +191,7 @@ def _emit(e: Env, payload: object) -> None:
 
 # ----- commands ------------------------------------------------------------------
 def cmd_upload(e: Env) -> int:
+    """`upload`: resolve the paths, build one zip, store it, write the outputs, then prune."""
     a = e.args
     ctx = _ctx(e)
     name = validate_artifact_name(a.name)
@@ -271,6 +275,8 @@ def _target_dir(dest: Path, record: ArtifactRecord, *, named: bool) -> Path:
 
 
 def cmd_download(e: Env) -> int:
+    """`download`: fetch one artifact, or every artifact of a run, verify each digest and
+    extract."""
     a = e.args
     store = _store(e)
     records = _select_for_download(e, store)
@@ -301,6 +307,7 @@ def cmd_download(e: Env) -> int:
 
 
 def cmd_list(e: Env) -> int:
+    """`list`: the artifacts of one run, or of the whole repository with `--all` or `--ref`."""
     a = e.args
     repo_wide = a.all or bool(a.ref)  # an explicit --ref asks about the repository, not one run
     if repo_wide and a.run_id:
@@ -328,6 +335,7 @@ def cmd_list(e: Env) -> int:
 
 
 def cmd_prune(e: Env) -> int:
+    """`prune`: trash the repository's expired artifacts, or only name them with `--dry-run`."""
     a = e.args
     ctx = _ctx(e, require_run=False)
     log.info(
@@ -341,6 +349,8 @@ def cmd_prune(e: Env) -> int:
 
 
 def cmd_login(e: Env) -> int:
+    """`login`: the browser sign-in. The token goes into a GitHub secret through gh, or to stdout
+    with `--print`."""
     a = e.args
     if e.settings.client_id == _client.CLIENT_ID and _client.CLIENT_ID.startswith("unset"):
         raise UsageError(
@@ -377,6 +387,7 @@ def cmd_login(e: Env) -> int:
 
 
 def cmd_logout(e: Env) -> int:
+    """`logout`: revoke the grant behind the token in the environment."""
     stored = _stored(e)
     log.info("revoking the grant held in %s", SECRET_NAME)
     revoke(e.http, e.settings, stored.refresh_token)
@@ -388,6 +399,7 @@ def cmd_logout(e: Env) -> int:
 
 
 def cmd_whoami(e: Env) -> int:
+    """`whoami`: the client in use, whether a token is set, and the root folder if there is one."""
     has_token = e.settings.token_text is not None
     log.info(
         "looking up the root folder" if has_token else "no token set; skipping the root folder"
