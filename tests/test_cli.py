@@ -388,7 +388,7 @@ def test_login_print_and_gh(run: Run, fake: FakeDrive) -> None:
     calls: GhCalls = []
     assert run("login", "--repo", "o/r", open_browser=_browser(fake), run_gh=_gh(calls)) == 0
     assert [args for args, _ in calls] == [
-        ["auth", "status"],
+        ["auth", "status", "--active", "--hostname", "github.com"],
         ["secret", "set", SECRET_NAME, "--repo", "o/r"],
     ]
     assert calls[0][1] == ""
@@ -416,7 +416,9 @@ def test_login_checks_gh_before_the_browser_opens(run: Run, fake: FakeDrive) -> 
     assert "gh is not authenticated" in err
     assert "gh auth login" in err
     assert "--print" in err
-    assert [args for args, _ in calls] == [["auth", "status"]]  # and never `secret set`
+    assert [args for args, _ in calls] == [
+        ["auth", "status", "--active", "--hostname", "github.com"]
+    ]  # and never `secret set`
     assert opened == []  # no consent flow started
     assert fake.auth_codes == {}
     assert fake.requests == []  # not even the token endpoint
@@ -901,3 +903,55 @@ def test_gh_that_cannot_be_executed_points_at_print(
     assert "--print" in err
     assert "filesystem error" not in err
     assert opened == []
+
+
+def test_the_cli_reports_bad_retention_days_with_the_stores_own_message(run: Run) -> None:
+    assert run("upload", "--path", "dist/", "--retention-days", "0") == 2
+    assert "retention days must be 1..400, got 0" in run.stderr.getvalue()
+    assert run.fake.requests == []  # refused before anything was zipped or sent
+
+
+@pytest.mark.parametrize(
+    ("gh_host", "host"), [(None, "github.com"), ("ghe.example.test", "ghe.example.test")]
+)
+def test_login_asks_gh_about_one_host_only(
+    run: Run, fake: FakeDrive, gh_host: str | None, host: str
+) -> None:
+    """Plain `gh auth status` fails when any configured host has a broken login, which would
+    send a user whose github.com login is fine to `--print`."""
+    if gh_host is not None:
+        run.env["GH_HOST"] = gh_host
+    calls: GhCalls = []
+    assert run("login", "--repo", "o/r", open_browser=_browser(fake), run_gh=_gh(calls)) == 0
+    assert calls[0][0] == ["auth", "status", "--active", "--hostname", host]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in for gh is a POSIX shell script")
+def test_the_default_gh_runner_keeps_the_status_probe_off_the_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text('#!/bin/sh\necho "noise on stdout: $1 $2"\necho "noise on stderr" >&2\nexit 0\n')
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    assert cli._default_run_gh(["auth", "status", "--active", "--hostname", "github.com"], "") == 0
+    quiet = capfd.readouterr()
+    assert (quiet.out, quiet.err) == ("", "")
+    assert cli._default_run_gh(["secret", "set", "X", "--repo", "o/r"], "{}") == 0
+    loud = capfd.readouterr()
+    assert "noise on stdout: secret set" in loud.out  # gh's own words about the secret still show
+
+
+def test_verbose_output_follows_the_stream_of_each_call(fake: FakeDrive, tmp_path: Path) -> None:
+    """A second call in the same process with another stderr must not log to the first one."""
+    first, second = Run(fake, tmp_path / "one"), Run(fake, tmp_path / "two")
+    for r in (first, second):
+        r.env.pop("DRIVE_ARTIFACTS_TOKEN")
+    assert first("--verbose", "whoami") == 0
+    assert second("--verbose", "whoami") == 0
+    assert first.stderr.getvalue().count("no token set; skipping the root folder") == 1
+    assert second.stderr.getvalue().count("no token set; skipping the root folder") == 1
+    assert first("whoami") == 0  # not verbose: nothing more is said
+    assert first.stderr.getvalue().count("no token set") == 1

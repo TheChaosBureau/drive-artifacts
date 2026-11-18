@@ -9,9 +9,9 @@ import pytest
 
 from drive_artifacts.archive import sha256_file
 from drive_artifacts.drive import DriveClient, DriveFile
-from drive_artifacts.errors import DriveError, IntegrityError, UsageError
+from drive_artifacts.errors import ConflictError, DriveError, IntegrityError, UsageError
 from drive_artifacts.model import FOLDER_MIME, ArtifactKey, ArtifactRecord, Repo, RunContext
-from drive_artifacts.store import ArtifactStore
+from drive_artifacts.store import ArtifactStore, validate_retention_days
 from tests.fake_drive import FakeDrive
 
 
@@ -98,9 +98,11 @@ def test_duplicate_name_conflicts_unless_overwrite(
 ) -> None:
     path, digest, size = _zip(tmp_path, "w.zip", b"one")
     first = store.put(ctx, "wheel", path, sha256=digest, size=size, retention_days=1)
-    with pytest.raises(DriveError, match="already exists") as info:
+    with pytest.raises(ConflictError, match="already exists") as info:
         store.put(ctx, "wheel", path, sha256=digest, size=size, retention_days=1)
-    assert info.value.reason == "conflict"
+    # Drive said nothing here: the store refused. Same exit code as before, its own class.
+    assert not isinstance(info.value, DriveError)
+    assert info.value.exit_code == 5
     path2, digest2, size2 = _zip(tmp_path, "w2.zip", b"two")
     second = store.put(
         ctx, "wheel", path2, sha256=digest2, size=size2, retention_days=1, overwrite=True
@@ -706,3 +708,16 @@ def test_a_failed_re_read_after_a_bare_final_response_trashes_the_upload(
     assert [f.trashed for f in artifacts] == [True]
     retry = store.put(ctx, "wheel", path, sha256=digest, size=size, retention_days=1)  # no conflict
     assert not fake.files[retry.file_id].trashed
+
+
+@pytest.mark.parametrize("days", [0, -1, 401])
+def test_retention_days_are_validated_by_one_rule(
+    store: ArtifactStore, ctx: RunContext, tmp_path: Path, days: int
+) -> None:
+    path, digest, size = _zip(tmp_path, "w.zip", b"one")
+    with pytest.raises(UsageError, match=rf"retention days must be 1\.\.400, got {days}"):
+        validate_retention_days(days)
+    with pytest.raises(UsageError, match=rf"retention days must be 1\.\.400, got {days}"):
+        store.put(ctx, "wheel", path, sha256=digest, size=size, retention_days=days)
+    assert validate_retention_days(1) == 1
+    assert validate_retention_days(400) == 400

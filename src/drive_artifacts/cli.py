@@ -34,7 +34,7 @@ from drive_artifacts.github import Actions, read_run_context
 from drive_artifacts.model import ArtifactRecord, RunContext, validate_artifact_name
 from drive_artifacts.oauth import RefreshingTokenSource, StoredToken, loopback_login, revoke
 from drive_artifacts.settings import Settings
-from drive_artifacts.store import MAX_RETENTION_DAYS, ArtifactStore
+from drive_artifacts.store import ArtifactStore, validate_retention_days
 
 SECRET_NAME = "DRIVE_ARTIFACTS_TOKEN"  # noqa: S105 - the name of the secret, not its value
 log = logging.getLogger("drive_artifacts")
@@ -191,8 +191,7 @@ def cmd_upload(e: Env) -> int:
     a = e.args
     ctx = _ctx(e)
     name = validate_artifact_name(a.name)
-    if not 1 <= a.retention_days <= MAX_RETENTION_DAYS:
-        raise UsageError(f"--retention-days must be 1..{MAX_RETENTION_DAYS}")
+    validate_retention_days(a.retention_days)  # before anything is zipped or sent
     patterns = [line for chunk in a.path for line in chunk.splitlines()]
     log.info("uploading %s from %s", name, patterns)
     resolved = resolve_paths(patterns, e.cwd, include_hidden=a.include_hidden_files)
@@ -350,7 +349,9 @@ def cmd_login(e: Env) -> int:
         )
     # Before any consent: a grant that cannot be stored would only have to be revoked again.
     # A missing gh raises its own UsageError from the runner.
-    if not a.print and e.run_gh(["auth", "status"], "") != 0:
+    # One host only: a broken login on some other configured host is not this command's business.
+    host = e.env.get("GH_HOST") or "github.com"
+    if not a.print and e.run_gh(["auth", "status", "--active", "--hostname", host], "") != 0:
         raise UsageError(
             "gh is not authenticated; run `gh auth login`, "
             "or re-run with --print and add the secret by hand"
@@ -434,9 +435,13 @@ def _default_run_gh(args: list[str], stdin: str) -> int:
     gh = shutil.which("gh")
     if gh is None:
         raise UsageError("gh is not on PATH; re-run with --print and add the secret by hand")
+    # The login probe is a yes/no question: its account listing stays off the terminal.
+    quiet = subprocess.DEVNULL if args[:2] == ["auth", "status"] else None
     # The secret goes in on stdin, never in argv.
     try:
-        return subprocess.run([gh, *args], input=stdin, text=True, check=False).returncode  # noqa: S603 - argv list, no shell
+        return subprocess.run(  # noqa: S603 - argv list, no shell
+            [gh, *args], input=stdin, text=True, check=False, stdout=quiet, stderr=quiet
+        ).returncode
     except OSError as exc:
         raise UsageError(
             f"could not run gh ({exc}); re-run with --print and add the secret by hand"
@@ -459,38 +464,46 @@ def main(
     out: TextIO = sys.stdout if stdout is None else stdout
     err: TextIO = sys.stderr if stderr is None else stderr
     args = _parser().parse_args(argv)
-    logging.basicConfig(stream=err, level=logging.WARNING, format="%(message)s")
+    # A handler of this call's own on this package's logger: `basicConfig` would bind the root
+    # logger to the first stream it ever saw, and do nothing at all once a host program has
+    # configured logging. Removed again when the call ends.
+    handler = logging.StreamHandler(err)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(handler)
     log.setLevel(logging.INFO if args.verbose else logging.WARNING)
     # httpx logs full request URLs at INFO; ours carry the upload session id.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     actions = Actions(environ, err)
-    with httpx.Client(transport=transport) as http:
-        e = Env(
-            args=args,
-            env=environ,
-            settings=Settings.from_env(environ),
-            actions=actions,
-            stdout=out,
-            stderr=err,
-            cwd=(cwd or Path.cwd()).resolve(),
-            http=http,
-            open_browser=open_browser or _default_open_browser(err),
-            run_gh=run_gh or _default_run_gh,
-        )
-        try:
-            return COMMANDS[args.command](e)
-        except DriveArtifactsError as exc:
-            actions.error(str(exc))
-            return exc.exit_code
-        except BrokenPipeError:
-            # `drive-artifacts list | head -1`: the reader left. Not an error of ours, and
-            # there is nobody to tell; 141 is what a shell reports for a SIGPIPE death.
-            return 141
-        except OSError as exc:
-            # A full disk, a read-only directory: the environment, not the artifact.
-            actions.error(f"filesystem error: {exc}")
-            return 1
-        except KeyboardInterrupt:
-            actions.error("interrupted")
-            return 130
+    try:
+        with httpx.Client(transport=transport) as http:
+            e = Env(
+                args=args,
+                env=environ,
+                settings=Settings.from_env(environ),
+                actions=actions,
+                stdout=out,
+                stderr=err,
+                cwd=(cwd or Path.cwd()).resolve(),
+                http=http,
+                open_browser=open_browser or _default_open_browser(err),
+                run_gh=run_gh or _default_run_gh,
+            )
+            try:
+                return COMMANDS[args.command](e)
+            except DriveArtifactsError as exc:
+                actions.error(str(exc))
+                return exc.exit_code
+            except BrokenPipeError:
+                # `drive-artifacts list | head -1`: the reader left. Not an error of ours, and
+                # there is nobody to tell; 141 is what a shell reports for a SIGPIPE death.
+                return 141
+            except OSError as exc:
+                # A full disk, a read-only directory: the environment, not the artifact.
+                actions.error(f"filesystem error: {exc}")
+                return 1
+            except KeyboardInterrupt:
+                actions.error("interrupted")
+                return 130
+    finally:
+        log.removeHandler(handler)
