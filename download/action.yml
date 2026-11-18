@@ -1,0 +1,62 @@
+name: Drive Artifacts (download)
+description: Download an artifact that Drive Artifacts stored in your Google Drive.
+author: The Chaos Bureau
+branding:
+  icon: download-cloud
+  color: blue
+inputs:
+  name:
+    description: Artifact name. Omit to download every artifact of the run into subdirectories named after them.
+    default: ""
+  path:
+    description: Directory to extract into.
+    default: "."
+  token:
+    description: The DRIVE_ARTIFACTS_TOKEN secret.
+    required: true
+  run-id:
+    description: Download from another run of this repository.
+    default: ""
+  ref:
+    description: Download the latest artifact of this name for a ref, e.g. refs/heads/main. Needs `name`.
+    default: ""
+  commit:
+    description: Download the latest artifact of this name for a commit. Needs `name`.
+    default: ""
+  root:
+    description: Name of the root folder the app owns in your Drive.
+    default: GitHub Artifacts
+  source:
+    description: The requirement uvx installs. Leave at the default.
+    default: drive-artifacts==0.1.0
+outputs:
+  download-path:
+    description: Absolute path of the directory the artifact(s) were extracted into.
+    value: ${{ steps.download.outputs.download-path }}
+  artifact-digest:
+    description: sha256 of the downloaded zip, prefixed `sha256:`. Set only when a single artifact was downloaded.
+    value: ${{ steps.download.outputs.artifact-digest }}
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      with:
+        enable-cache: false
+    - id: download
+      shell: bash
+      env:
+        DRIVE_ARTIFACTS_TOKEN: ${{ inputs.token }}
+        DRIVE_ARTIFACTS_ROOT: ${{ inputs.root }}
+        DA_SOURCE: ${{ inputs.source }}
+        DA_NAME: ${{ inputs.name }}
+        DA_PATH: ${{ inputs.path }}
+        DA_RUN_ID: ${{ inputs.run-id }}
+        DA_REF: ${{ inputs.ref }}
+        DA_COMMIT: ${{ inputs.commit }}
+      run: |
+        args=(download --path "$DA_PATH")
+        if [ -n "$DA_NAME" ]; then args+=(--name "$DA_NAME"); fi
+        if [ -n "$DA_RUN_ID" ]; then args+=(--run-id "$DA_RUN_ID"); fi
+        if [ -n "$DA_REF" ]; then args+=(--ref "$DA_REF"); fi
+        if [ -n "$DA_COMMIT" ]; then args+=(--commit "$DA_COMMIT"); fi
+        uvx --from "$DA_SOURCE" drive-artifacts "${args[@]}"

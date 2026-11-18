@@ -1,0 +1,115 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "drive-artifacts"
+version = "0.1.0"
+description = "GitHub Actions artifacts, stored in your own Google Drive"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "The Chaos Bureau" }]
+keywords = ["github-actions", "artifacts", "google-drive", "ci"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Build Tools",
+  "Typing :: Typed",
+]
+dependencies = ["httpx>=0.28,<1"]
+
+[project.urls]
+Homepage = "https://github.com/TheChaosBureau/drive-artifacts"
+Changelog = "https://github.com/TheChaosBureau/drive-artifacts/blob/main/CHANGELOG.md"
+Issues = "https://github.com/TheChaosBureau/drive-artifacts/issues"
+
+[project.scripts]
+drive-artifacts = "drive_artifacts.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=9,<10",
+  "pytest-cov>=7,<8",
+  "hypothesis>=6.130,<7",
+  "mypy>=2.4,<3",
+  "pyright>=1.1.400,<2",
+  "ruff>=0.17,<0.18",
+  "zizmor>=1.30,<2",
+  "actionlint-py>=1.7,<2",
+  "pip-audit>=2.10,<3",
+  "pre-commit>=4,<5",
+  "pyyaml>=6,<7",
+  "types-pyyaml>=6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/drive_artifacts"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["docs"]  # the plan and spec carry code as dictated text; ruff 0.17 formats Markdown
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "N", "UP", "B", "C4", "SIM", "RUF", "PT", "ANN", "S",
+  "A", "ARG", "BLE", "DTZ", "ERA", "ISC", "PIE", "RET", "RSE", "T20", "TID", "PTH", "PERF", "FURB", "LOG", "G",
+]
+ignore = [
+  "E501",    # the formatter owns line length
+  "S101",    # assert is how tests assert
+  "ANN401",  # Any is sometimes the honest type for JSON
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "ANN", "ARG", "PLR2004", "T20", "DTZ"]
+"src/drive_artifacts/cli.py" = ["T20"]  # the CLI prints its own output
+
+[tool.ruff.lint.isort]
+known-first-party = ["drive_artifacts"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+files = ["src", "tests"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+include = ["src", "tests"]
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+xfail_strict = true
+filterwarnings = ["error"]
+markers = [
+  "contract: talks to the real Google Drive API; needs DRIVE_ARTIFACTS_TOKEN",
+]
+
+[tool.coverage.run]
+source = ["drive_artifacts"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]

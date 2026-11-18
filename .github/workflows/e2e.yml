@@ -1,0 +1,153 @@
+name: e2e
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+# One run at a time against the real Drive, shared with the nightly contract workflow.
+concurrency:
+  group: real-drive
+  cancel-in-progress: false
+# The actions under test are used by path (`./`, `./download`). zizmor would prefer GitHub's `$/`
+# form, but actionlint 1.7.x rejects it as a malformed reference and both linters gate CI, so
+# the three local uses below carry a zizmor ignore for `self-repository`.
+jobs:
+  # Stays green and does nothing until the repository has the DRIVE_ARTIFACTS_TOKEN secret.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          HAS_TOKEN: ${{ secrets.DRIVE_ARTIFACTS_TOKEN != '' }}
+        run: echo "ready=$HAS_TOKEN" >> "$GITHUB_OUTPUT"
+  upload:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      digest: ${{ steps.up.outputs.artifact-digest }}
+      # The expected digests reach the download matrix as a job output: this
+      # repository stores nothing as a GitHub Actions artifact, its own action
+      # under test included.
+      expected-sha256: ${{ steps.expected.outputs.lines }}
+    env:
+      DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+      DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The zip is rooted at build/ itself, so the digests are taken relative to it. They are
+      # binary-mode (`*` marker) so the Windows check below never translates line endings.
+      - run: |
+          mkdir -p build/sub
+          echo "hello from $GITHUB_RUN_ID" > build/hello.txt
+          head -c 3000000 /dev/urandom > build/sub/noise.bin
+          (cd build && sha256sum --binary hello.txt sub/noise.bin) > expected.sha256
+      - id: expected
+        run: |
+          { echo 'lines<<EXPECTED_SHA256'; cat expected.sha256; echo 'EXPECTED_SHA256'; } >> "$GITHUB_OUTPUT"
+      - id: up
+        uses: ./ # zizmor: ignore[self-repository]
+        with:
+          name: e2e
+          path: |
+            build/
+            !build/**/*.tmp
+          token: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+          retention-days: 2
+          source: ${{ github.workspace }}
+      # Each step has its own $GITHUB_STEP_SUMMARY file, so the action's summary is not
+      # readable here; its outputs are.
+      - env:
+          DIGEST: ${{ steps.up.outputs.artifact-digest }}
+          ARTIFACT_ID: ${{ steps.up.outputs.artifact-id }}
+          SIZE: ${{ steps.up.outputs.size }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test -n "$ARTIFACT_ID"
+          test "$SIZE" -ge 3000000
+  download:
+    needs: upload
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+      DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - shell: bash
+        env:
+          EXPECTED: ${{ needs.upload.outputs.expected-sha256 }}
+        run: printf '%s\n' "$EXPECTED" > expected.sha256
+      - id: down
+        uses: ./download # zizmor: ignore[self-repository]
+        with:
+          name: e2e
+          path: restored
+          token: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+          source: ${{ github.workspace }}
+      - shell: bash
+        env:
+          UPLOADED: ${{ needs.upload.outputs.digest }}
+          DOWNLOADED: ${{ steps.down.outputs.artifact-digest }}
+        run: |
+          test "$UPLOADED" = "$DOWNLOADED"
+          cd restored && sha256sum -c ../expected.sha256
+  download-windows:
+    needs: upload
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+      DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - shell: bash
+        env:
+          EXPECTED: ${{ needs.upload.outputs.expected-sha256 }}
+        run: printf '%s\n' "$EXPECTED" > expected.sha256
+      - id: down
+        uses: ./download # zizmor: ignore[self-repository]
+        with:
+          name: e2e
+          path: restored
+          token: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+          source: ${{ github.workspace }}
+      - shell: bash
+        env:
+          UPLOADED: ${{ needs.upload.outputs.digest }}
+          DOWNLOADED: ${{ steps.down.outputs.artifact-digest }}
+        run: |
+          test "$UPLOADED" = "$DOWNLOADED"
+          cd restored && sha256sum -c ../expected.sha256
+  latest:
+    needs: download
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+      DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # This run's own ref, not a fixed main: a manual dispatch from a branch uploads under
+      # that branch's ref, and its newest artifact must be the one this run just stored.
+      - uses: ./download # zizmor: ignore[self-repository]
+        with:
+          name: e2e
+          ref: ${{ github.ref }}
+          path: latest
+          token: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+          source: ${{ github.workspace }}
+      - run: grep -q "hello from $GITHUB_RUN_ID" latest/hello.txt

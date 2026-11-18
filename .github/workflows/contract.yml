@@ -1,0 +1,44 @@
+name: contract
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  # Stays green and does nothing until the repository has the DRIVE_ARTIFACTS_TOKEN secret.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - id: check
+        env:
+          HAS_TOKEN: ${{ secrets.DRIVE_ARTIFACTS_TOKEN != '' }}
+        run: echo "ready=$HAS_TOKEN" >> "$GITHUB_OUTPUT"
+  contract:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One job at a time against the real Drive, shared with the e2e workflow.
+    concurrency:
+      group: real-drive
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.13"
+      - run: uv sync --all-groups
+      - env:
+          DRIVE_ARTIFACTS_TOKEN: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+          DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+          DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
+        run: uv run pytest tests/contract -m contract -q -ra

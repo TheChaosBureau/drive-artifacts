@@ -1,0 +1,95 @@
+name: Drive Artifacts
+description: Store a GitHub Actions artifact in your own Google Drive, with the same inputs as actions/upload-artifact.
+author: The Chaos Bureau
+branding:
+  icon: upload-cloud
+  color: blue
+inputs:
+  name:
+    description: Artifact name.
+    default: artifact
+  path:
+    description: Files, directories or globs to upload, one per line. A leading "!" excludes.
+    required: true
+  token:
+    description: The DRIVE_ARTIFACTS_TOKEN secret made by `drive-artifacts login`.
+    required: true
+  retention-days:
+    description: Days until the artifact is trashed (1-400).
+    default: "90"
+  if-no-files-found:
+    description: warn, error or ignore when nothing matches `path`.
+    default: warn
+  compression-level:
+    description: Zip compression level, 0 (store) to 9.
+    default: "6"
+  overwrite:
+    description: Replace an artifact of the same name in this run.
+    default: "false"
+  include-hidden-files:
+    description: Include files and directories whose name starts with a dot.
+    default: "false"
+  root:
+    description: Name of the root folder the app owns in your Drive.
+    default: GitHub Artifacts
+  prune:
+    description: Trash this repository's expired artifacts after the upload.
+    default: "true"
+  source:
+    description: The requirement uvx installs. Leave at the default.
+    default: drive-artifacts==0.1.0
+outputs:
+  artifact-id:
+    description: Drive file id of the uploaded zip.
+    value: ${{ steps.upload.outputs.artifact-id }}
+  artifact-url:
+    description: Drive link to the uploaded zip.
+    value: ${{ steps.upload.outputs.artifact-url }}
+  artifact-digest:
+    description: sha256 of the uploaded zip, prefixed `sha256:`.
+    value: ${{ steps.upload.outputs.artifact-digest }}
+  size:
+    description: Size of the zip in bytes.
+    value: ${{ steps.upload.outputs.size }}
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        enable-cache: false
+    - id: upload
+      shell: bash
+      env:
+        DRIVE_ARTIFACTS_TOKEN: ${{ inputs.token }}
+        DRIVE_ARTIFACTS_ROOT: ${{ inputs.root }}
+        DA_SOURCE: ${{ inputs.source }}
+        DA_NAME: ${{ inputs.name }}
+        DA_PATH: ${{ inputs.path }}
+        DA_RETENTION_DAYS: ${{ inputs.retention-days }}
+        DA_IF_NO_FILES_FOUND: ${{ inputs.if-no-files-found }}
+        DA_COMPRESSION_LEVEL: ${{ inputs.compression-level }}
+        DA_OVERWRITE: ${{ inputs.overwrite }}
+        DA_INCLUDE_HIDDEN: ${{ inputs.include-hidden-files }}
+        DA_PRUNE: ${{ inputs.prune }}
+      run: |
+        args=(upload --name "$DA_NAME" --path "$DA_PATH"
+              --retention-days "$DA_RETENTION_DAYS"
+              --if-no-files-found "$DA_IF_NO_FILES_FOUND"
+              --compression-level "$DA_COMPRESSION_LEVEL")
+        # Booleans as actions/upload-artifact reads them (YAML 1.2 core schema); anything else fails.
+        case "$DA_OVERWRITE" in
+          true|True|TRUE) args+=(--overwrite) ;;
+          false|False|FALSE) ;;
+          *) echo "::error::overwrite must be true or false, got '$DA_OVERWRITE'"; exit 2 ;;
+        esac
+        case "$DA_INCLUDE_HIDDEN" in
+          true|True|TRUE) args+=(--include-hidden-files) ;;
+          false|False|FALSE) ;;
+          *) echo "::error::include-hidden-files must be true or false, got '$DA_INCLUDE_HIDDEN'"; exit 2 ;;
+        esac
+        case "$DA_PRUNE" in
+          true|True|TRUE) ;;
+          false|False|FALSE) args+=(--no-prune) ;;
+          *) echo "::error::prune must be true or false, got '$DA_PRUNE'"; exit 2 ;;
+        esac
+        uvx --from "$DA_SOURCE" drive-artifacts "${args[@]}"

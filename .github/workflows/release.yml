@@ -1,0 +1,67 @@
+name: release
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          grep -q "^version = \"$version\"$" pyproject.toml || { echo "::error::pyproject version != $version"; exit 1; }
+          grep -q "default: drive-artifacts==$version$" action.yml || { echo "::error::action.yml source pin != $version"; exit 1; }
+          grep -q "default: drive-artifacts==$version$" download/action.yml || { echo "::error::download/action.yml source pin != $version"; exit 1; }
+          grep -q "^## \[$version\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+          python-version: "3.13"
+      - run: uv sync --locked --all-groups && uv run pytest -q -m "not contract"
+  # Build, PyPI and the GitHub Release are one job: the wheel never leaves the
+  # runner, so nothing is stored as a GitHub Actions artifact.
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: pypi
+    permissions:
+      id-token: write # PyPI trusted publishing
+      contents: write # create the release and move the major tag
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: false
+          python-version: "3.13"
+      - run: uv build
+      # skip-existing: a re-run after a later step failed must not fail on the upload.
+      - run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/drive-artifacts/
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          version="${TAG#v}"
+          awk -v v="$version" '/^## \[/{p = index($0, "[" v "]") > 0} p' CHANGELOG.md > notes.md
+          # A re-run of this job must not fail on a release that already exists.
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md
+          major="v${version%%.*}"
+          # Singular `git/ref/...` is an exact match. The plural `git/refs/tags/$major` matches by
+          # prefix (`v0` finds `v0.1.0`), so it would report a missing major tag as present and
+          # the PATCH below would then fail. Do not "fix" this back to the plural form.
+          if gh api "repos/$REPO/git/ref/tags/$major" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/tags/$major" -f sha="$SHA" -F force=true
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/$major" -f sha="$SHA"
+          fi
