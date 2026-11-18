@@ -1058,6 +1058,8 @@ def test_chunk_size_must_be_positive(
 ) -> None:
     with pytest.raises(ValueError, match="positive"):
         DriveClient(http, tokens, settings, chunk_size=size)
+
+
 def test_list_files_stops_after_max_pages(drive: DriveClient, fake: FakeDrive) -> None:
     for i in range(5):
         fake.add_file(f"f{i}", b"x", props={"k": "v"})

@@ -340,10 +340,6 @@ class DriveClient:
                 DriveFile.from_json(f) for f in (listed if isinstance(listed, list) else [])
             )
             token = str(body["nextPageToken"]) if body.get("nextPageToken") else None
-            if not token:
-            body = self._request("GET", f"{self._api}/files", params=params).json()
-            files.extend(DriveFile.from_json(f) for f in body.get("files", []))
-            token = body.get("nextPageToken")
             pages += 1
             if not token or (max_pages is not None and pages >= max_pages):
                 return files
