@@ -4,17 +4,41 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 
-from drive_artifacts.drive import DriveClient
-from drive_artifacts.model import Repo, RunContext
+from drive_artifacts.drive import DriveClient, DriveFile
+from drive_artifacts.errors import DriveArtifactsError
+from drive_artifacts.model import FOLDER_MIME, Repo, RunContext, prop, query
 from drive_artifacts.oauth import RefreshingTokenSource, StoredToken
 from drive_artifacts.settings import Settings
 from drive_artifacts.store import ArtifactStore
+
+CONTRACT_ROOT = re.compile(r"GitHub Artifacts \(contract [0-9a-f]{8}\)")
+STALE_AFTER = timedelta(days=1)
+
+
+def stale_contract_roots(folders: Sequence[DriveFile], now: datetime) -> list[DriveFile]:
+    """The throwaway roots of earlier sessions that never reached their teardown (a killed
+    runner, a cancelled job). Only folders this suite named, and only once they are more
+    than a day old: a root of a session that is still running is never touched."""
+    stale: list[DriveFile] = []
+    for folder in folders:
+        if CONTRACT_ROOT.fullmatch(folder.name) is None:
+            continue
+        try:
+            created = datetime.fromisoformat(folder.created_time)
+        except ValueError:
+            continue  # no usable date: leave it alone
+        if created.tzinfo is not None and now - created > STALE_AFTER:
+            stale.append(folder)
+    return stale
 
 
 @pytest.fixture(scope="session")
@@ -31,7 +55,13 @@ def real_drive(real_settings: Settings) -> Iterator[DriveClient]:
         tokens = RefreshingTokenSource(
             http, real_settings, StoredToken.parse(real_settings.token_text or "")
         )
-        yield DriveClient(http, tokens, real_settings)
+        drive = DriveClient(http, tokens, real_settings)
+        # Housekeeping, never a reason to fail the session: sweep what earlier sessions left.
+        with suppress(DriveArtifactsError):
+            roots = drive.list_files(query(prop("da.kind", "root"), f"mimeType = '{FOLDER_MIME}'"))
+            for leftover in stale_contract_roots(roots, datetime.now(UTC)):
+                drive.trash(leftover.id)
+        yield drive
 
 
 @pytest.fixture(scope="session")

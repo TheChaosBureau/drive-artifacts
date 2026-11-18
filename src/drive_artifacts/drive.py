@@ -20,6 +20,7 @@ FIELDS = "id,name,mimeType,parents,appProperties,size,createdTime,modifiedTime,w
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 RATE_LIMIT_REASONS = frozenset({"userRateLimitExceeded", "rateLimitExceeded"})
 TIMEOUT = httpx.Timeout(30.0, read=120.0)
+DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024  # of a resumable upload; a multiple of 256 KiB
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +127,7 @@ class DriveClient:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         rng: Callable[[], float] = random.random,
-        chunk_size: int = 8 * 1024 * 1024,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
     ) -> None:
         if chunk_size % (256 * 1024) and chunk_size >= 256 * 1024:
             raise ValueError("chunk_size must be a multiple of 256 KiB")

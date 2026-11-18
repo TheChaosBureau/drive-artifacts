@@ -20,7 +20,7 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 ZIP_MIME = "application/zip"
 MAX_NAME_BYTES = 100
 PROPERTY_LIMIT = 124  # Drive: key + value, UTF-8 bytes
-FORBIDDEN = set('":<>|*?\r\n/\\\x00')  # NUL: no path may hold it, and the name becomes one
+FORBIDDEN = frozenset('":<>|*?\r\n/\\\x00')  # NUL: no path may hold it, and the name becomes one
 RESERVED_NAMES = frozenset({".", ".."})
 # `da.ref` is informational (a filter key, not identity), so a ref longer than this is
 # stored as a digest instead of failing the upload. 117 is the controller's ruling.
