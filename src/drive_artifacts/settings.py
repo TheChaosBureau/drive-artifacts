@@ -12,6 +12,7 @@ GOOGLE_API = "https://www.googleapis.com"
 GOOGLE_OAUTH = "https://oauth2.googleapis.com"
 GOOGLE_AUTH_PAGE = "https://accounts.google.com/o/oauth2/v2/auth"
 SCOPE = "https://www.googleapis.com/auth/drive.file"
+DEFAULT_ROOT_NAME = "GitHub Artifacts"  # the folder the app owns in the user's Drive
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,5 +56,5 @@ class Settings:
             client_id=env.get("DRIVE_ARTIFACTS_CLIENT_ID") or _client.CLIENT_ID,
             client_secret=env.get("DRIVE_ARTIFACTS_CLIENT_SECRET") or _client.CLIENT_SECRET,
             token_text=token,
-            root_name=env.get("DRIVE_ARTIFACTS_ROOT") or "GitHub Artifacts",
+            root_name=env.get("DRIVE_ARTIFACTS_ROOT") or DEFAULT_ROOT_NAME,
         )

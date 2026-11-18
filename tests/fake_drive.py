@@ -4,8 +4,12 @@
 Quirks modelled on purpose: duplicate names, pagination, appProperties queries,
 trash, resumable sessions with 308 offsets, byte-range downloads, access-token
 expiry and revocation, invalid_grant, PKCE on the code exchange, and scheduled
-faults (403/429/5xx, dropped connections, chunks only partly received, downloads
-and error bodies cut mid-stream).
+faults (403/429/5xx, dropped connections, requests processed whose answer is lost,
+chunks only partly received, downloads and error bodies cut mid-stream).
+
+Answers carry only the fields the request asked for with ``fields``; without it a
+file is ``kind``, ``id``, ``name`` and ``mimeType``, as Drive answers. A client call
+that forgets ``fields`` therefore fails here as it would against Drive.
 
 A fault that has no meaning for the request it matches (``truncate_to`` on
 anything but a resumable PUT, ``cut_after`` without a ``status`` on anything but
@@ -33,11 +37,19 @@ FOLDER = "application/vnd.google-apps.folder"
 class Fault:
     """A scheduled failure.
 
-    ``drop`` raises ``httpx.ConnectError`` (the server hangs up). ``truncate_to`` keeps
+    ``drop`` raises ``httpx.ConnectError`` (the server hangs up). ``drop_after`` does the
+    same after the request was processed: the state changed, the answer is lost.
+    ``truncate_to`` keeps
     that many bytes of a resumable chunk PUT and answers 308. ``cut_after`` lets the
     first N bytes of an ``alt=media`` body through, then fails the stream; given an
     explicit ``status`` as well, it cuts that error response's body instead, on any
     request. Otherwise the fault answers ``status`` (503 when unset).
+
+    ``path`` narrows the fault. With a slash it is a part of the URL path; with an equals
+    sign it is one query parameter and its value; otherwise it is a whole path segment or
+    the name or value of a query parameter (``id-1`` never matches ``id-12``). A fault
+    without a ``path`` is a Drive fault: the OAuth endpoints are reached only by naming them.
+    The fake keeps its own tally of uses: a ``Fault`` is not changed by being used.
     """
 
     status: int | None = None
@@ -48,11 +60,24 @@ class Fault:
     truncate_to: int | None = None
     reason: str = "backendError"
     cut_after: int | None = None
+    drop_after: bool = False
 
     def matches(self, request: httpx.Request) -> bool:
         if self.method and request.method != self.method:
             return False
-        return not self.path or self.path in str(request.url)
+        url = request.url
+        if not self.path:
+            return not url.path.endswith(("/token", "/revoke"))
+        if "/" in self.path:
+            return self.path in url.path
+        if "=" in self.path:
+            key, _, value = self.path.partition("=")
+            return value in url.params.get_list(key)
+        return (
+            self.path in url.path.split("/")
+            or self.path in url.params
+            or self.path in url.params.values()
+        )
 
 
 class CutStream(httpx.SyncByteStream):
@@ -87,6 +112,7 @@ class FakeFile:
 
     def to_json(self) -> dict[str, object]:
         body: dict[str, object] = {
+            "kind": "drive#file",
             "id": self.id,
             "name": self.name,
             "mimeType": self.mime_type,
@@ -109,6 +135,7 @@ class _Session:
     received: bytearray = field(default_factory=bytearray)
     expired: bool = False
     file_id: str | None = None
+    fields: str | None = None  # of the opening POST: what the final answer carries
 
 
 _TERM = re.compile(
@@ -169,6 +196,50 @@ def _cut(response: httpx.Response, cut: int, request: httpx.Request) -> httpx.Re
     )
 
 
+DEFAULT_FIELDS = ("kind", "id", "name", "mimeType")
+FILE_FIELDS = frozenset(
+    {
+        "kind",
+        "id",
+        "name",
+        "mimeType",
+        "parents",
+        "appProperties",
+        "trashed",
+        "createdTime",
+        "modifiedTime",
+        "webViewLink",
+        "size",
+    }
+)
+_FILES_OF = re.compile(r"files\(([^()]*)\)")
+
+
+class _BadFieldsError(ValueError):
+    """The `fields` parameter asks for something Drive (as modelled here) does not have."""
+
+
+def _names(spec: str) -> list[str]:
+    return [name.strip() for name in spec.split(",") if name.strip()]
+
+
+def _project(body: dict[str, object], spec: str | None) -> dict[str, object]:
+    """One file resource cut down to `spec`: a comma list, `*`, or None for Drive's default."""
+    if spec is None:
+        return {k: body[k] for k in DEFAULT_FIELDS}
+    wanted = _names(spec)
+    if "*" in wanted:
+        return body
+    unknown = [name for name in wanted if name not in FILE_FIELDS]
+    if unknown or not wanted:
+        raise _BadFieldsError(f"Invalid field selection {spec!r}")
+    return {k: body[k] for k in wanted if k in body}  # a folder has no size: simply absent
+
+
+def _bad_fields(exc: _BadFieldsError) -> httpx.Response:
+    return _error(400, "invalidParameter", str(exc))
+
+
 class FakeDrive:
     def __init__(self, client_id: str = "cid", client_secret: str = "csec") -> None:
         self.client_id = client_id
@@ -180,6 +251,7 @@ class FakeDrive:
         self.refresh_tokens: set[str] = {"rt-1"}
         self.revoked: list[str] = []
         self.access_tokens: set[str] = {"at-1"}
+        self.issued_access_tokens: set[str] = {"at-1"}  # never shrinks: for leak checks
         self.auth_codes: dict[str, str] = {}  # code -> code_challenge
         # Answer the last chunk of an upload with only id, name and mimeType: what Drive sends
         # when the session's `fields` does not reach the final response.
@@ -187,6 +259,7 @@ class FakeDrive:
         self._minted: dict[str, str] = {}  # access token -> the refresh token that minted it
         self._clock = datetime(2026, 10, 11, tzinfo=UTC)
         self._counter = 0
+        self._used: dict[int, int] = {}  # id(fault) -> times it fired; the Fault stays as given
 
     # ----- helpers for tests -------------------------------------------------
     def _next(self, prefix: str) -> str:
@@ -268,14 +341,21 @@ class FakeDrive:
         request.read()
         self.requests.append(request)
         cut_after: int | None = None
+        lose_answer = False
         for fault in list(self.faults):
             if not fault.matches(request):
                 continue
-            fault.count -= 1
-            if fault.count <= 0:
+            used = self._used.get(id(fault), 0) + 1
+            if used >= fault.count:
                 self.faults.remove(fault)
+                self._used.pop(id(fault), None)
+            else:
+                self._used[id(fault)] = used
             if fault.drop:
                 raise httpx.ConnectError("injected", request=request)
+            if fault.drop_after:
+                lose_answer = True
+                break  # the request is served below; only its answer is lost
             if fault.truncate_to is not None:
                 if not _is_chunk_put(request):
                     return _error(
@@ -303,6 +383,16 @@ class FakeDrive:
                 break  # the download itself is served below, cut short
             status = 503 if fault.status is None else fault.status
             return _error(status, fault.reason, f"injected {status}")
+        try:
+            response = self._route(request, cut_after=cut_after)
+        except _BadFieldsError as exc:
+            return _bad_fields(exc)
+        if lose_answer:
+            raise httpx.ConnectError("injected after processing", request=request)
+        return response
+
+    def _route(self, request: httpx.Request, *, cut_after: int | None) -> httpx.Response:
+        fields = request.url.params.get("fields")
         path = request.url.path
         if path.endswith("/token"):
             return self._token(request)
@@ -321,9 +411,9 @@ class FakeDrive:
             return _error(404, "notFound", f"no route {path}")
         file_id = m.group(1)
         if file_id is None and request.method == "POST":
-            return httpx.Response(
-                200, json=self._create(json.loads(request.content), b"").to_json()
-            )
+            _project(dict.fromkeys(FILE_FIELDS, ""), fields)  # refuse bad `fields` before creating
+            created = self._create(json.loads(request.content), b"")
+            return httpx.Response(200, json=_project(created.to_json(), fields))
         if file_id is None and request.method == "GET":
             return self._list(request)
         if file_id is None:
@@ -334,15 +424,21 @@ class FakeDrive:
         if _is_media_get(request):
             return self._media(request, f, cut_after=cut_after)
         if request.method == "GET":
-            return httpx.Response(200, json=f.to_json())
+            return httpx.Response(200, json=_project(f.to_json(), fields))
         if request.method == "PATCH":
             body = json.loads(request.content)
+            unmodelled = sorted(set(body) - {"trashed", "name"})
+            if unmodelled:
+                return _error(
+                    400, "badRequest", f"the fake does not model changing {', '.join(unmodelled)}"
+                )
+            _project(dict.fromkeys(FILE_FIELDS, ""), fields)  # refuse bad `fields` before changing
             if "trashed" in body:
                 f.trashed = bool(body["trashed"])
             if "name" in body:
                 f.name = str(body["name"])
             f.modified_time = self._now()
-            return httpx.Response(200, json=f.to_json())
+            return httpx.Response(200, json=_project(f.to_json(), fields))
         return _error(405, "methodNotAllowed", request.method)
 
     def _token(self, request: httpx.Request) -> httpx.Response:
@@ -363,6 +459,7 @@ class FakeDrive:
                 )
             at = self._next("at-")
             self.access_tokens.add(at)
+            self.issued_access_tokens.add(at)
             self._minted[at] = form["refresh_token"]
             return httpx.Response(
                 200,
@@ -389,6 +486,7 @@ class FakeDrive:
             rt, at = self._next("rt-"), self._next("at-")
             self.refresh_tokens.add(rt)
             self.access_tokens.add(at)
+            self.issued_access_tokens.add(at)
             self._minted[at] = rt
             return httpx.Response(
                 200,
@@ -457,10 +555,13 @@ class FakeDrive:
 
         rows = [f for f in self.files.values() if ok(f)]
         order_by = request.url.params.get("orderBy", "")
-        if order_by.startswith("modifiedTime"):
-            rows.sort(key=lambda f: f.modified_time, reverse=order_by.endswith("desc"))
-        elif order_by.startswith("createdTime"):
-            rows.sort(key=lambda f: f.created_time, reverse=order_by.endswith("desc"))
+        order = re.fullmatch(r"(modifiedTime|createdTime)( desc)?", order_by)
+        if order_by and order is None:
+            return _error(400, "invalid", f"Invalid orderBy: {order_by!r}")
+        if order is not None and order.group(1) == "modifiedTime":
+            rows.sort(key=lambda f: f.modified_time, reverse=bool(order.group(2)))
+        elif order is not None:
+            rows.sort(key=lambda f: f.created_time, reverse=bool(order.group(2)))
         size_text = request.url.params.get("pageSize", "100")
         start_text = request.url.params.get("pageToken", "0")
         if not (size_text.isascii() and size_text.isdigit() and int(size_text) >= 1):
@@ -469,8 +570,25 @@ class FakeDrive:
             return _error(400, "invalid", f"Invalid pageToken: {start_text!r}")
         size, start = int(size_text), int(start_text)
         page = rows[start : start + size]
-        body: dict[str, object] = {"files": [f.to_json() for f in page]}
-        if start + size < len(rows):
+        # `fields` for a listing: `files(a,b)` and `nextPageToken`, each only when asked for;
+        # without `fields`, both, with Drive's default file fields.
+        spec = request.url.params.get("fields")
+        file_spec: str | None = None
+        with_files = with_token = True
+        if spec is not None and spec.strip() != "*":
+            inner = _FILES_OF.search(spec)
+            rest = _names(_FILES_OF.sub("", spec))
+            if not set(rest) <= {"nextPageToken", "files", "kind"} or "(" in "".join(rest):
+                raise _BadFieldsError(f"Invalid field selection {spec!r}")
+            with_files = inner is not None or "files" in rest
+            with_token = "nextPageToken" in rest
+            file_spec = inner.group(1) if inner is not None else None
+        elif spec is not None:
+            file_spec = "*"
+        body: dict[str, object] = {}
+        if with_files:
+            body["files"] = [_project(f.to_json(), file_spec) for f in page]
+        if with_token and start + size < len(rows):
             body["nextPageToken"] = str(start + size)
         return httpx.Response(200, json=body)
 
@@ -509,7 +627,11 @@ class FakeDrive:
         meta = json.loads(request.content) if request.content else {}
         length = request.headers.get("X-Upload-Content-Length")
         upload_id = self._next("upload-")
-        self.sessions[upload_id] = _Session(metadata=meta, total=int(length) if length else None)
+        self.sessions[upload_id] = _Session(
+            metadata=meta,
+            total=int(length) if length else None,
+            fields=request.url.params.get("fields"),
+        )
         base = f"{request.url.scheme}://{request.url.netloc.decode()}{request.url.path}"
         return httpx.Response(
             200, headers={"Location": f"{base}?uploadType=resumable&upload_id={upload_id}"}
@@ -520,7 +642,7 @@ class FakeDrive:
         if session is None or session.expired:
             return _error(404, "notFound", "upload session not found")
         if session.file_id is not None:
-            return self._finished(self.files[session.file_id])
+            return self._finished(self.files[session.file_id], session)
         header = request.headers.get("Content-Range", "")
         m = re.fullmatch(r"bytes (\*|(\d+)-(\d+))/(\d+|\*)", header)
         if m is None:
@@ -550,12 +672,12 @@ class FakeDrive:
         if session.total is not None and len(session.received) >= session.total:
             f = self._create(session.metadata, bytes(session.received[: session.total]))
             session.file_id = f.id
-            return self._finished(f)
+            return self._finished(f, session)
         headers = {"Range": f"bytes=0-{len(session.received) - 1}"} if session.received else {}
         return httpx.Response(308, headers=headers)
 
-    def _finished(self, f: FakeFile) -> httpx.Response:
-        body = f.to_json()
+    def _finished(self, f: FakeFile, session: _Session) -> httpx.Response:
         if self.bare_final_response:
-            body = {k: body[k] for k in ("id", "name", "mimeType")}
-        return httpx.Response(200, json=body)
+            body = f.to_json()
+            return httpx.Response(200, json={k: body[k] for k in ("id", "name", "mimeType")})
+        return httpx.Response(200, json=_project(f.to_json(), session.fields))

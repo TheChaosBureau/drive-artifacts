@@ -18,7 +18,9 @@ from tests.fake_drive import FakeDrive
 from tests.fake_server import serve
 
 MASK = "::add-mask::"
-CHUNK = 8 * 1024 * 1024  # the CLI's resumable-upload chunk size
+# A literal on purpose: this module never imports the package. `test_drive.py` pins that the
+# client's default is this value.
+CHUNK = 8 * 1024 * 1024
 
 
 @pytest.fixture
@@ -136,7 +138,9 @@ def test_upload_and_download_round_trip_through_a_real_socket(
         "download output file": _read(second / "output"),
         "download summary file": _read(second / "summary"),
     }
-    for secret in {refresh_token, "at-", *masked}:
+    # Every access token the fake ever issued, not the bare prefix: `at-` may turn up in
+    # benign text one day, a whole token may not.
+    for secret in {refresh_token, *fake.issued_access_tokens, *masked}:
         for label, text in surfaces.items():
             assert secret not in text, f"{secret!r} leaked into the {label}"
 

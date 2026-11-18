@@ -330,6 +330,22 @@ def test_validate_never_returns_an_oversized_or_forbidden_name(name: str) -> Non
     assert out not in {".", ".."}
 
 
+_PLAIN = st.characters(
+    codec="utf-8", exclude_characters='":<>|*?\r\n/\\\x00', exclude_categories=["Cs"]
+)
+
+
+@given(st.text(_PLAIN, min_size=1, max_size=MAX_NAME_BYTES))
+def test_validate_accepts_every_name_without_a_forbidden_character_that_fits(name: str) -> None:
+    """The other half of the property above: nothing harmless is refused."""
+    wanted = name.strip()
+    if not wanted or wanted in {".", ".."} or len(wanted.encode()) > MAX_NAME_BYTES:
+        with pytest.raises(UsageError):
+            validate_artifact_name(name)
+    else:
+        assert validate_artifact_name(name) == wanted
+
+
 def _unescape(s: str) -> str:
     out: list[str] = []
     i = 0

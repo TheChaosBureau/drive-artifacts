@@ -108,7 +108,8 @@ def test_trash_hides_from_list_and_get_still_works() -> None:
     c = client(fake)
     assert c.patch(f"{API}/drive/v3/files/{fid}", json={"trashed": True}).status_code == 200
     assert c.get(f"{API}/drive/v3/files", params={"q": "trashed = false"}).json()["files"] == []
-    assert c.get(f"{API}/drive/v3/files/{fid}").json()["trashed"] is True
+    got = c.get(f"{API}/drive/v3/files/{fid}", params={"fields": "trashed"})
+    assert got.json()["trashed"] is True
     assert c.get(f"{API}/drive/v3/files/missing").status_code == 404
 
 
@@ -152,7 +153,7 @@ def test_resumable_upload_308_semantics_and_truncation() -> None:
     data = bytes(range(256)) * 4  # 1024 bytes
     r = c.post(
         f"{API}/upload/drive/v3/files",
-        params={"uploadType": "resumable"},
+        params={"uploadType": "resumable", "fields": "id,size,appProperties"},
         json={"name": "a.zip", "appProperties": {"da.kind": "artifact"}},
         headers={"X-Upload-Content-Length": "1024"},
     )
@@ -276,7 +277,7 @@ def test_real_http_server_round_trip() -> None:
         assert r.status_code == 200
         session = httpx.post(
             f"{base}/api/upload/drive/v3/files",
-            params={"uploadType": "resumable"},
+            params={"uploadType": "resumable", "fields": "id,size"},
             json={"name": "z"},
             headers={"Authorization": "Bearer at-1"},
         ).headers["location"]
@@ -657,5 +658,216 @@ def test_bare_final_response_answers_the_last_chunk_with_id_name_and_mime_type_o
     # asking the finished session again gives the same bare answer; a plain GET gives it all
     again = c.put(session, headers={"Content-Range": "bytes */4"})
     assert again.json() == r.json()
-    full = c.get(f"{API}/drive/v3/files/{r.json()['id']}").json()
+    full = c.get(f"{API}/drive/v3/files/{r.json()['id']}", params={"fields": "*"}).json()
     assert (full["size"], full["webViewLink"] != "", full["createdTime"] != "") == ("4", True, True)
+
+
+# ----- fidelity gaps closed after the pre-release reviews --------------------------------------
+
+DEFAULT_FIELDS = {"kind", "id", "name", "mimeType"}
+
+
+def test_a_file_answer_carries_only_the_requested_fields() -> None:
+    """Drive answers a metadata call with `kind`, `id`, `name` and `mimeType` unless `fields` asks
+    for more. A client call that forgets `fields` must not pass against the fake."""
+    fake = FakeDrive()
+    c = client(fake)
+    fid = fake.add_file("a.zip", b"abcd", props={"k": "v"})
+    url = f"{API}/drive/v3/files/{fid}"
+    assert set(c.get(url).json()) == DEFAULT_FIELDS
+    assert c.get(url).json()["kind"] == "drive#file"
+    assert c.get(url, params={"fields": "id,size"}).json() == {"id": fid, "size": "4"}
+    assert c.get(url, params={"fields": " id , appProperties "}).json() == {
+        "id": fid,
+        "appProperties": {"k": "v"},
+    }
+    everything = c.get(url, params={"fields": "*"}).json()
+    assert {"size", "createdTime", "modifiedTime", "webViewLink", "parents", "trashed"} <= set(
+        everything
+    )
+    assert c.get(url, params={"fields": "id,noSuchField"}).status_code == 400
+    created = c.post(f"{API}/drive/v3/files", json={"name": "n"})
+    assert set(created.json()) == DEFAULT_FIELDS
+    created = c.post(
+        f"{API}/drive/v3/files", params={"fields": "id,createdTime"}, json={"name": "n"}
+    )
+    assert set(created.json()) == {"id", "createdTime"}
+    patched = c.patch(url, params={"fields": "id,trashed"}, json={"trashed": True})
+    assert patched.json() == {"id": fid, "trashed": True}
+    assert set(c.patch(url, json={"trashed": False}).json()) == DEFAULT_FIELDS
+
+
+def test_a_listing_carries_only_the_requested_fields() -> None:
+    fake = FakeDrive()
+    c = client(fake)
+    for i in range(3):
+        fake.add_file(f"f{i}", b"x")
+    url = f"{API}/drive/v3/files"
+    plain = c.get(url, params={"pageSize": 2}).json()
+    assert all(set(f) == DEFAULT_FIELDS for f in plain["files"])
+    assert "nextPageToken" in plain
+    picked = c.get(url, params={"pageSize": 2, "fields": "nextPageToken,files(id,size)"}).json()
+    assert all(set(f) == {"id", "size"} for f in picked["files"])
+    assert "nextPageToken" in picked
+    # a page token the caller did not ask for is not sent: the classic way to lose pages
+    files_only = c.get(url, params={"pageSize": 2, "fields": "files(id)"}).json()
+    assert set(files_only) == {"files"}
+    assert c.get(url, params={"fields": "files(id"}).status_code == 400
+
+
+def test_the_last_chunk_answers_with_the_fields_the_session_was_opened_with() -> None:
+    fake = FakeDrive()
+    c = client(fake)
+    opened = c.post(
+        f"{API}/upload/drive/v3/files",
+        params={"uploadType": "resumable", "fields": "id,size,webViewLink"},
+        json={"name": "a"},
+        headers={"X-Upload-Content-Length": "4"},
+    )
+    done = c.put(
+        opened.headers["location"], content=b"abcd", headers={"Content-Range": "bytes 0-3/4"}
+    )
+    assert set(done.json()) == {"id", "size", "webViewLink"}
+    plain = start_upload(c, 4)  # opened without `fields`
+    done = c.put(plain, content=b"abcd", headers={"Content-Range": "bytes 0-3/4"})
+    assert set(done.json()) == DEFAULT_FIELDS
+
+
+def test_a_fault_is_not_changed_by_being_used() -> None:
+    fake = FakeDrive()
+    twice = Fault(status=500, method="GET", count=2)
+    fake.faults.append(twice)
+    c = client(fake)
+    assert [c.get(f"{API}/drive/v3/files").status_code for _ in range(3)] == [500, 500, 200]
+    assert twice.count == 2  # the caller's object can be scheduled again as it is
+    fake.faults.append(twice)
+    assert [c.get(f"{API}/drive/v3/files").status_code for _ in range(3)] == [500, 500, 200]
+
+
+def test_a_fault_without_a_path_is_a_drive_fault_and_leaves_the_token_endpoint_alone() -> None:
+    fake = FakeDrive()
+    fake.faults.append(Fault(status=503, method="POST"))
+    form = {
+        "grant_type": "refresh_token",
+        "refresh_token": "rt-1",
+        "client_id": "cid",
+        "client_secret": "csec",
+    }
+    with httpx.Client(transport=httpx.MockTransport(fake.handler)) as plain:
+        assert plain.post("https://oauth2.googleapis.com/token", data=form).status_code == 200
+    assert len(fake.faults) == 1  # still waiting for a Drive POST
+    assert client(fake).post(f"{API}/drive/v3/files", json={"name": "n"}).status_code == 503
+    fake.faults.append(Fault(status=503, path="/token"))  # naming the endpoint reaches it
+    with httpx.Client(transport=httpx.MockTransport(fake.handler)) as plain:
+        assert plain.post("https://oauth2.googleapis.com/token", data=form).status_code == 503
+
+
+def test_a_fault_path_names_a_whole_segment_or_parameter_not_a_substring() -> None:
+    fake = FakeDrive()
+    ids = [fake.add_file(f"f{i}", b"x") for i in range(12)]
+    assert (ids[0], ids[11]) == ("id-1", "id-12")
+    c = client(fake)
+    fake.faults.append(Fault(status=500, method="GET", path="id-1"))
+    assert c.get(f"{API}/drive/v3/files/id-12").status_code == 200
+    assert c.get(f"{API}/drive/v3/files/id-1").status_code == 500
+    fake.faults.append(Fault(status=500, path="alt=media"))
+    assert c.get(f"{API}/drive/v3/files/id-2").status_code == 200
+    assert c.get(f"{API}/drive/v3/files/id-2", params={"alt": "media"}).status_code == 500
+    fake.faults.append(Fault(status=500, path="pageSize"))  # a parameter's name
+    assert c.get(f"{API}/drive/v3/files", params={"pageSize": 5}).status_code == 500
+    fake.faults.append(Fault(status=500, path="/v3/files/id-3"))  # with a slash: part of the path
+    assert c.get(f"{API}/drive/v3/files/id-3").status_code == 500
+
+
+def test_drop_after_processes_the_request_and_then_loses_the_answer() -> None:
+    """The real-world cause of duplicate folders and of a server that is ahead of its client."""
+    fake = FakeDrive()
+    c = client(fake)
+    fake.faults.append(Fault(drop_after=True, method="POST"))
+    with pytest.raises(httpx.ConnectError):
+        c.post(f"{API}/drive/v3/files", json={"name": "made-anyway"})
+    assert [f.name for f in fake.live_files()] == ["made-anyway"]
+    session = start_upload(c, 8)
+    fake.faults.append(Fault(drop_after=True, method="PUT", path="upload_id"))
+    with pytest.raises(httpx.ConnectError):
+        c.put(session, content=b"abcd", headers={"Content-Range": "bytes 0-3/8"})
+    held = c.put(session, headers={"Content-Range": "bytes */8"})
+    assert (held.status_code, held.headers["range"]) == (308, "bytes=0-3")
+    assert fake.faults == []
+
+
+def test_patch_refuses_a_field_the_fake_does_not_model() -> None:
+    fake = FakeDrive()
+    fid = fake.add_file("a", b"x")
+    r = client(fake).patch(f"{API}/drive/v3/files/{fid}", json={"starred": True})
+    assert r.status_code == 400
+    assert "starred" in r.json()["error"]["message"]
+
+
+def test_queries_by_name_and_by_mime_type_and_duplicate_names() -> None:
+    fake = FakeDrive()
+    c = client(fake)
+    folder = fake.add_folder("same")
+    first = fake.add_file("same", b"1")
+    second = fake.add_file("same", b"2")  # Drive allows any number of files with one name
+    fake.add_file("it's", b"3")
+    url = f"{API}/drive/v3/files"
+
+    def ids(q: str) -> list[str]:
+        return [f["id"] for f in c.get(url, params={"q": q}).json()["files"]]
+
+    assert ids("name = 'same'") == [folder, first, second]
+    assert ids("name = 'same' and mimeType != 'application/vnd.google-apps.folder'") == [
+        first,
+        second,
+    ]
+    assert ids("name = 'same' and mimeType = 'application/vnd.google-apps.folder'") == [folder]
+    assert len(ids("name = 'it\\'s'")) == 1
+    assert ids("name = 'absent'") == []
+
+
+def test_listings_are_ordered_only_when_asked() -> None:
+    fake = FakeDrive()
+    c = client(fake)
+    a, b, d = (fake.add_file(n, b"x") for n in ("a", "b", "d"))
+    c.patch(f"{API}/drive/v3/files/{a}", json={"name": "renamed"})  # moves modifiedTime only
+    url = f"{API}/drive/v3/files"
+
+    def ids(order: str | None) -> list[str]:
+        params = {} if order is None else {"orderBy": order}
+        return [f["id"] for f in c.get(url, params=params).json()["files"]]
+
+    assert ids("createdTime") == [a, b, d]
+    assert ids("createdTime desc") == [d, b, a]
+    assert ids("modifiedTime desc") == [a, d, b]
+    assert ids("modifiedTime") == [b, d, a]
+    assert c.get(url, params={"orderBy": "sizeOfShoes"}).status_code == 400
+
+
+def test_expired_access_tokens_are_401_until_a_refresh() -> None:
+    fake = FakeDrive()
+    assert client(fake).get(f"{API}/drive/v3/files").status_code == 200
+    fake.expire_access_tokens()
+    assert client(fake).get(f"{API}/drive/v3/files").status_code == 401
+    form = {
+        "grant_type": "refresh_token",
+        "refresh_token": "rt-1",
+        "client_id": "cid",
+        "client_secret": "csec",
+    }
+    with httpx.Client(transport=httpx.MockTransport(fake.handler)) as plain:
+        fresh = plain.post("https://oauth2.googleapis.com/token", data=form).json()["access_token"]
+    assert client(fake, fresh).get(f"{API}/drive/v3/files").status_code == 200
+
+
+def test_a_chunk_that_does_not_start_where_the_session_stands_is_400() -> None:
+    fake = FakeDrive()
+    c = client(fake)
+    session = start_upload(c, 8)
+    ahead = c.put(session, content=b"efgh", headers={"Content-Range": "bytes 4-7/8"})
+    assert ahead.status_code == 400
+    assert "server has 0" in ahead.json()["error"]["message"]
+    c.put(session, content=b"abcd", headers={"Content-Range": "bytes 0-3/8"})
+    again = c.put(session, content=b"abcd", headers={"Content-Range": "bytes 0-3/8"})
+    assert again.status_code == 400
+    assert "server has 4" in again.json()["error"]["message"]

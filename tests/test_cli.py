@@ -840,3 +840,64 @@ def test_a_failed_gh_revokes_nothing(run: Run, fake: FakeDrive) -> None:
     assert "was not stored" in err
     assert minted not in run.stdout.getvalue() + err
     assert run("whoami") == 0  # the stored token still works
+
+
+def test_download_all_with_nothing_stored_succeeds_with_a_warning(run: Run) -> None:
+    """`actions/download-artifact` without a name succeeds with "0 artifact(s)" on a run that
+    stored nothing; only a download that names an artifact fails when it is missing."""
+    assert run("download", "--path", "all", "--json") == 0
+    err = run.stderr.getvalue()
+    assert "::warning::no artifacts found for run 12345" in err
+    assert "::error::" not in err
+    assert run.outputs()["download-path"] == str((run.cwd / "all").resolve())
+    assert "artifact-digest" not in run.outputs()
+    assert run.json() == []
+    assert run("download", "--name", "nope", "--path", "all") == 4
+
+
+def test_download_path_expands_a_leading_tilde(
+    run: Run, fake: FakeDrive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    run("upload", "--name", "wheel", "--path", "dist/")
+    assert run("download", "--name", "wheel", "--path", "~/out") == 0
+    assert (home / "out" / "a.whl").read_bytes() == b"wheel"
+    assert not (run.cwd / "~").exists()
+    assert run.outputs()["download-path"] == str((home / "out").resolve())
+
+
+def test_a_closed_stdout_pipe_ends_quietly(run: Run) -> None:
+    """`drive-artifacts list | head -1`: the reader left; that is not a filesystem error."""
+
+    class ClosedPipe(io.StringIO):
+        def write(self, _text: str) -> int:
+            raise BrokenPipeError(32, "Broken pipe")
+
+    run("upload", "--name", "w", "--path", "dist/")
+    before = run.stderr.getvalue()
+    run.stdout = ClosedPipe()
+    assert run("list") == 141
+    said = run.stderr.getvalue()[len(before) :]
+    assert "::error::" not in said  # no annotation, and no traceback either
+    assert "Traceback" not in said
+    assert "filesystem error" not in said
+
+
+def test_gh_that_cannot_be_executed_points_at_print(
+    run: Run, fake: FakeDrive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def denied(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("shutil.which", lambda _name: "/opt/bin/gh")
+    monkeypatch.setattr("subprocess.run", denied)
+    opened: list[str] = []
+    assert run("login", "--repo", "o/r", "--timeout", "1", open_browser=opened.append) == 2
+    err = run.stderr.getvalue()
+    assert "could not run gh" in err
+    assert "--print" in err
+    assert "filesystem error" not in err
+    assert opened == []

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import secrets
 import time
@@ -19,11 +20,13 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
-from drive_artifacts.errors import AuthError
+from drive_artifacts.errors import AuthError, UsageError
 from drive_artifacts.settings import SCOPE, Settings
 
 REFRESH_MARGIN_S = 60.0
 DEFAULT_LIFETIME_S = 3600.0
+# How long one loopback connection may stay silent before the server moves on to the next.
+CONNECTION_READ_TIMEOUT_S = 5.0
 LOGIN_HINT = "run `drive-artifacts login` again and update the DRIVE_ARTIFACTS_TOKEN secret"
 
 
@@ -128,7 +131,7 @@ def _token_request(
         except httpx.RequestError as exc:  # transport failures, undecodable bodies, redirect loops
             last = f"{type(exc).__name__}: {exc}"
         else:
-            if response.status_code < 500:
+            if response.status_code < 500 and response.status_code != 429:
                 return _token_response(response, invalid_grant=invalid_grant)
             last = f"HTTP {response.status_code}"
         if attempt < 2:
@@ -152,7 +155,7 @@ def _token_response(response: httpx.Response, *, invalid_grant: str) -> dict[str
 
 
 def pkce_pair() -> tuple[str, str]:
-    verifier = secrets.token_urlsafe(64)[:96]
+    verifier = secrets.token_urlsafe(64)  # 86 characters, inside PKCE's 43..128
     digest = hashlib.sha256(verifier.encode()).digest()
     return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
 
@@ -231,6 +234,7 @@ def loopback_login(
     state = secrets.token_urlsafe(16)
     received: dict[str, str] = {}  # the one request that carried our state
     wrong_state = 0
+    refused_methods: list[str] = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib signature
@@ -247,35 +251,55 @@ def loopback_login(
                 self.send_error(404)
                 return
             received.update(query)
-            page = b"<html><body><p>drive-artifacts: you can close this tab.</p></body></html>"
+            if "error" in query:
+                outcome = f"login failed: Google reported {html.escape(query['error'])}."
+            elif not query.get("code"):
+                outcome = "login failed: the response carried no authorization code."
+            else:
+                outcome = "you can close this tab."
+            page = f"<html><body><p>drive-artifacts: {outcome}</p></body></html>".encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(page)))
             self.end_headers()
             self.wfile.write(page)
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+        def _refuse(self) -> None:
+            # Google redirects with a GET. Anything else is answered and named in the timeout.
+            refused_methods.append(self.command)
+            self.send_error(405)
+
+        do_POST = do_PUT = do_PATCH = do_DELETE = _refuse  # noqa: N815 - stdlib dispatch names
+
+    try:
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+    except OSError as exc:
+        raise UsageError(f"could not open a local port for the login: {exc}") from exc
     try:
         redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/"
         open_browser(
             build_auth_url(settings, redirect_uri=redirect_uri, state=state, challenge=challenge)
         )
         # `server.timeout` only bounds the wait for a connection. Once one arrives, the handler's
-        # own `timeout` bounds each socket read, so a client that connects and says nothing
-        # cannot hold the login past the deadline. Requests that do not carry our state are
-        # answered and ignored; the loop ends on the one that does, or on the deadline.
+        # own `timeout` bounds each socket read. The server takes one connection at a time, so
+        # that bound is short: a browser preconnect that connects and says nothing must not
+        # keep the real redirect waiting behind it, nor hold the login past the deadline.
+        # Requests that do not carry our state are answered and ignored; the loop ends on the
+        # one that does, or on the deadline.
         deadline = time.monotonic() + timeout
         while not received:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             server.timeout = remaining
-            Handler.timeout = remaining
+            Handler.timeout = min(remaining, CONNECTION_READ_TIMEOUT_S)
             server.handle_request()
     finally:
         server.server_close()
     if not received:
         detail = "; a response carrying the wrong state was refused" if wrong_state else ""
+        if refused_methods:
+            detail += f"; a {refused_methods[0]} request was refused (the redirect must be a GET)"
         raise AuthError(
             f"login timed out after {timeout:g} s without a valid response from the browser{detail}"
         )

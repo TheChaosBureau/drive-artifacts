@@ -39,7 +39,7 @@ outputs:
 runs:
   using: composite
   steps:
-    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+    - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       with:
         enable-cache: false
     - id: download
@@ -53,10 +53,13 @@ runs:
         DA_RUN_ID: ${{ inputs.run-id }}
         DA_REF: ${{ inputs.ref }}
         DA_COMMIT: ${{ inputs.commit }}
+        PYTHONUTF8: "1" # a Windows console is not UTF-8; artifact names may be
       run: |
-        args=(download --path "$DA_PATH")
-        if [ -n "$DA_NAME" ]; then args+=(--name "$DA_NAME"); fi
-        if [ -n "$DA_RUN_ID" ]; then args+=(--run-id "$DA_RUN_ID"); fi
-        if [ -n "$DA_REF" ]; then args+=(--ref "$DA_REF"); fi
-        if [ -n "$DA_COMMIT" ]; then args+=(--commit "$DA_COMMIT"); fi
-        uvx --from "$DA_SOURCE" drive-artifacts "${args[@]}"
+        # `--option=value`, so a value that starts with a dash is never read as an option.
+        args=(download --path="$DA_PATH")
+        if [ -n "$DA_NAME" ]; then args+=(--name="$DA_NAME"); fi
+        if [ -n "$DA_RUN_ID" ]; then args+=(--run-id="$DA_RUN_ID"); fi
+        if [ -n "$DA_REF" ]; then args+=(--ref="$DA_REF"); fi
+        if [ -n "$DA_COMMIT" ]; then args+=(--commit="$DA_COMMIT"); fi
+        # --no-config: the calling repository's uv.toml must not change how this installs.
+        uvx --no-config --from "$DA_SOURCE" drive-artifacts "${args[@]}"
