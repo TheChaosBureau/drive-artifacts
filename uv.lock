@@ -466,6 +466,22 @@ dev = [
     { name = "types-pyyaml" },
     { name = "zizmor" },
 ]
+lint = [
+    { name = "actionlint-py" },
+    { name = "mypy" },
+    { name = "pip-audit" },
+    { name = "pre-commit" },
+    { name = "pyright" },
+    { name = "ruff" },
+    { name = "types-pyyaml" },
+    { name = "zizmor" },
+]
+test = [
+    { name = "hypothesis" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pyyaml" },
+]
 
 [package.metadata]
 requires-dist = [{ name = "httpx", specifier = ">=0.28,<1" }]
@@ -484,6 +500,22 @@ dev = [
     { name = "ruff", specifier = ">=0.17,<0.18" },
     { name = "types-pyyaml", specifier = ">=6" },
     { name = "zizmor", specifier = ">=1.30,<2" },
+]
+lint = [
+    { name = "actionlint-py", specifier = ">=1.7,<2" },
+    { name = "mypy", specifier = ">=2.4,<3" },
+    { name = "pip-audit", specifier = ">=2.10,<3" },
+    { name = "pre-commit", specifier = ">=4,<5" },
+    { name = "pyright", specifier = ">=1.1.400,<2" },
+    { name = "ruff", specifier = ">=0.17,<0.18" },
+    { name = "types-pyyaml", specifier = ">=6" },
+    { name = "zizmor", specifier = ">=1.30,<2" },
+]
+test = [
+    { name = "hypothesis", specifier = ">=6.130,<7" },
+    { name = "pytest", specifier = ">=9,<10" },
+    { name = "pytest-cov", specifier = ">=7,<8" },
+    { name = "pyyaml", specifier = ">=6,<7" },
 ]
 
 [[package]]

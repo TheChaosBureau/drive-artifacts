@@ -26,6 +26,9 @@ _DRIVE = re.compile(r"[A-Za-z]:")  # a Windows drive prefix; other colons are le
 
 @dataclass(frozen=True, slots=True)
 class Resolved:
+    """What a set of `path` patterns matched: the files, the directories that stay empty, and the
+    root their names in the archive are relative to."""
+
     files: list[Path]
     empty_dirs: list[Path]
     root: Path
@@ -33,6 +36,8 @@ class Resolved:
 
 @dataclass(frozen=True, slots=True)
 class ZipResult:
+    """A zip that was built: where it is, its size and digest, and how many files it holds."""
+
     path: Path
     size: int
     sha256: str
@@ -157,6 +162,7 @@ def _search_base(pattern: str, cwd: Path) -> Path:
 
 
 def sha256_file(path: Path) -> str:
+    """The hex SHA-256 of a file."""
     with path.open("rb") as fh:
         return hashlib.file_digest(fh, "sha256").hexdigest()
 

@@ -39,6 +39,14 @@ class DriveError(DriveArtifactsError):
         self.reason = reason
 
 
+class ConflictError(DriveArtifactsError):
+    """An artifact of that name already exists for the run and overwrite was not asked for.
+
+    The store refuses it; Drive is never asked. It shares exit code 5 with `DriveError`."""
+
+    exit_code = 5
+
+
 class IntegrityError(DriveArtifactsError):
     """Downloaded bytes do not match the recorded digest, or the zip is unsafe to extract."""
 

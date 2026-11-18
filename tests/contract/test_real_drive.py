@@ -14,7 +14,7 @@ import pytest
 
 from drive_artifacts.archive import build_zip, resolve_paths, safe_extract, sha256_file
 from drive_artifacts.drive import DriveClient, DriveFile
-from drive_artifacts.errors import DriveError, IntegrityError, NotFoundError
+from drive_artifacts.errors import ConflictError, IntegrityError, NotFoundError
 from drive_artifacts.model import ArtifactKey, RunContext
 from drive_artifacts.oauth import RefreshingTokenSource, StoredToken
 from drive_artifacts.settings import Settings
@@ -56,7 +56,7 @@ def test_round_trip_find_latest_and_prune(
     safe_extract(out, extracted)
     assert (extracted / "a.txt").read_bytes() == b"alpha"
     assert (extracted / "sub" / "b.bin").read_bytes() == bytes(range(256)) * 3000
-    with pytest.raises(DriveError, match="already exists"):
+    with pytest.raises(ConflictError, match="already exists"):
         real_store.put(
             real_ctx, "contract", built.path, sha256=built.sha256, size=built.size, retention_days=1
         )

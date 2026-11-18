@@ -65,12 +65,16 @@ def fit_ref(ref: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Repo:
+    """A repository: its numeric id, which survives a rename, and its `owner/name` for people."""
+
     id: str  # GitHub numeric repository id, rename-safe
     slug: str  # owner/name, for humans
 
 
 @dataclass(frozen=True, slots=True)
 class RunContext:
+    """The run an artifact belongs to: repository, run id and attempt, ref and commit."""
+
     repo: Repo
     run_id: str
     run_attempt: str
@@ -80,6 +84,8 @@ class RunContext:
 
 @dataclass(frozen=True, slots=True)
 class ArtifactKey:
+    """What identifies one artifact: repository, run, attempt and name."""
+
     repo_id: str
     run_id: str
     run_attempt: str
@@ -87,11 +93,14 @@ class ArtifactKey:
 
     @property
     def filename(self) -> str:
+        """The zip's name in Drive: `<run id>-<attempt>-<name>.zip`."""
         return f"{self.run_id}-{self.run_attempt}-{self.name}.zip"
 
 
 @dataclass(frozen=True, slots=True)
 class ArtifactRecord:
+    """One stored artifact as read back from Drive: its key, file id, digest, size and expiry."""
+
     key: ArtifactKey
     file_id: str
     sha256: str
@@ -142,6 +151,7 @@ class ArtifactRecord:
             raise ValueError(f"malformed drive-artifacts file {file.get('id')!r}: {exc}") from exc
 
     def to_json(self) -> dict[str, object]:
+        """The record as the CLI prints it with `--json`."""
         return {
             "name": self.key.name,
             "run_id": self.key.run_id,
@@ -160,6 +170,7 @@ class ArtifactRecord:
 
 
 def check_properties(props: Mapping[str, str]) -> dict[str, str]:
+    """Refuse a property whose key and value together exceed Drive's limit; return a copy."""
     for key, value in props.items():
         what = f"property {key!r}"
         if _utf8_len(key, what) + _utf8_len(value, what) > PROPERTY_LIMIT:
@@ -170,6 +181,8 @@ def check_properties(props: Mapping[str, str]) -> dict[str, str]:
 def artifact_properties(
     key: ArtifactKey, *, sha256: str, ref: str, commit: str, expires: date
 ) -> dict[str, str]:
+    """The `appProperties` that make a Drive file an artifact: identity, digest, ref, commit and
+    expiry."""
     return check_properties(
         {
             "da.v": SCHEMA_VERSION,
@@ -187,6 +200,7 @@ def artifact_properties(
 
 
 def folder_properties(kind: Literal["root", "repo"], repo_id: str | None = None) -> dict[str, str]:
+    """The `appProperties` of the root folder, or of one repository's folder."""
     props = {"da.v": SCHEMA_VERSION, "da.kind": kind}
     if kind == "repo":
         if repo_id is None:
@@ -201,8 +215,10 @@ def escape(value: str) -> str:
 
 
 def prop(key: str, value: str) -> str:
+    """A Drive `q` term that matches one app property exactly."""
     return f"appProperties has {{ key='{escape(key)}' and value='{escape(value)}' }}"
 
 
 def query(*terms: str) -> str:
+    """Join `q` terms with `and`, and leave trashed files out."""
     return " and ".join([*terms, "trashed = false"])

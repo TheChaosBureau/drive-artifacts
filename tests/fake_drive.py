@@ -23,6 +23,7 @@ import base64
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -260,6 +261,8 @@ class FakeDrive:
         self._clock = datetime(2026, 10, 11, tzinfo=UTC)
         self._counter = 0
         self._used: dict[int, int] = {}  # id(fault) -> times it fired; the Fault stays as given
+        # The fake is not thread-safe. Whatever serves it from several threads takes this lock.
+        self.lock = threading.Lock()
 
     # ----- helpers for tests -------------------------------------------------
     def _next(self, prefix: str) -> str:
@@ -340,17 +343,15 @@ class FakeDrive:
     def handler(self, request: httpx.Request) -> httpx.Response:
         request.read()
         self.requests.append(request)
-        cut_after: int | None = None
+        cut: Fault | None = None  # a download cut, spent only once a download is served
         lose_answer = False
         for fault in list(self.faults):
             if not fault.matches(request):
                 continue
-            used = self._used.get(id(fault), 0) + 1
-            if used >= fault.count:
-                self.faults.remove(fault)
-                self._used.pop(id(fault), None)
-            else:
-                self._used[id(fault)] = used
+            if fault.cut_after is not None and fault.status is None and _is_media_get(request):
+                cut = fault
+                break  # the download itself is served below, cut short
+            self._spend(fault)
             if fault.drop:
                 raise httpx.ConnectError("injected", request=request)
             if fault.drop_after:
@@ -372,26 +373,36 @@ class FakeDrive:
                     request,
                 )
             if fault.cut_after is not None:
-                if not _is_media_get(request):
-                    return _error(
-                        400,
-                        "badRequest",
-                        "injected cut_after fault matched a request that is not an alt=media "
-                        f"GET: {request.method} {request.url.path}",
-                    )
-                cut_after = fault.cut_after
-                break  # the download itself is served below, cut short
+                return _error(
+                    400,
+                    "badRequest",
+                    "injected cut_after fault matched a request that is not an alt=media "
+                    f"GET: {request.method} {request.url.path}",
+                )
             status = 503 if fault.status is None else fault.status
             return _error(status, fault.reason, f"injected {status}")
         try:
-            response = self._route(request, cut_after=cut_after)
+            response = self._route(request)
         except _BadFieldsError as exc:
             return _bad_fields(exc)
+        if cut is not None and cut.cut_after is not None and response.status_code in (200, 206):
+            # Only a download that was really served is cut; a 401, 404 or 416 that matched
+            # first leaves the fault waiting for one.
+            self._spend(cut)
+            response = _cut(response, cut.cut_after, request)
         if lose_answer:
             raise httpx.ConnectError("injected after processing", request=request)
         return response
 
-    def _route(self, request: httpx.Request, *, cut_after: int | None) -> httpx.Response:
+    def _spend(self, fault: Fault) -> None:
+        used = self._used.get(id(fault), 0) + 1
+        if used >= fault.count:
+            self.faults.remove(fault)
+            self._used.pop(id(fault), None)
+        else:
+            self._used[id(fault)] = used
+
+    def _route(self, request: httpx.Request) -> httpx.Response:
         fields = request.url.params.get("fields")
         path = request.url.path
         if path.endswith("/token"):
@@ -422,7 +433,7 @@ class FakeDrive:
         if f is None:
             return _error(404, "notFound", f"File not found: {file_id}.")
         if _is_media_get(request):
-            return self._media(request, f, cut_after=cut_after)
+            return self._media(request, f)
         if request.method == "GET":
             return httpx.Response(200, json=_project(f.to_json(), fields))
         if request.method == "PATCH":
@@ -592,9 +603,7 @@ class FakeDrive:
             body["nextPageToken"] = str(start + size)
         return httpx.Response(200, json=body)
 
-    def _media(
-        self, request: httpx.Request, f: FakeFile, *, cut_after: int | None
-    ) -> httpx.Response:
+    def _media(self, request: httpx.Request, f: FakeFile) -> httpx.Response:
         size = len(f.content)
         status = 200
         data = f.content
@@ -620,8 +629,7 @@ class FakeDrive:
             status = 206
             data = f.content[first : last + 1]
             headers["Content-Range"] = f"bytes {first}-{last}/{size}"
-        response = httpx.Response(status, content=data, headers=headers)
-        return response if cut_after is None else _cut(response, cut_after, request)
+        return httpx.Response(status, content=data, headers=headers)
 
     def _start_session(self, request: httpx.Request) -> httpx.Response:
         meta = json.loads(request.content) if request.content else {}
