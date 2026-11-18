@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import io
+import os
 from pathlib import Path
 
 import pytest
@@ -120,10 +121,13 @@ def test_mask_of_an_empty_value_writes_nothing() -> None:
 def test_an_output_with_a_carriage_return_uses_the_heredoc_form(tmp_path: Path) -> None:
     out = tmp_path / "out"
     Actions({**ENV, "GITHUB_OUTPUT": str(out)}, io.StringIO()).output("x", "a\rb")
+    # Bytes, not text: reading as text would fold the lone carriage return into a line end.
+    # The file is written in text mode, so line ends are the platform's (CRLF on Windows).
     text = out.read_bytes().decode()
-    name, delimiter = text.split("\n", 1)[0].split("<<")
+    eol = os.linesep
+    name, delimiter = text.split(eol, 1)[0].split("<<")
     assert name == "x"
-    assert text == f"x<<{delimiter}\na\rb\n{delimiter}\n"
+    assert text == f"x<<{delimiter}{eol}a\rb{eol}{delimiter}{eol}"
 
 
 def test_a_multi_line_output_is_closed_by_its_own_delimiter(tmp_path: Path) -> None:
