@@ -264,10 +264,6 @@ def loopback_login(
             self.end_headers()
             self.wfile.write(page)
 
-    try:
-        server = HTTPServer(("127.0.0.1", 0), Handler)
-    except OSError as exc:
-        raise UsageError(f"could not open a local port for the login: {exc}") from exc
         def _refuse(self) -> None:
             # Google redirects with a GET. Anything else is answered and named in the timeout.
             refused_methods.append(self.command)
@@ -275,7 +271,10 @@ def loopback_login(
 
         do_POST = do_PUT = do_PATCH = do_DELETE = _refuse  # noqa: N815 - stdlib dispatch names
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    try:
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+    except OSError as exc:
+        raise UsageError(f"could not open a local port for the login: {exc}") from exc
     try:
         redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/"
         open_browser(

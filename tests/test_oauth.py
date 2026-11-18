@@ -366,6 +366,8 @@ def test_a_loopback_port_that_cannot_be_opened_is_a_usage_error(
     with pytest.raises(UsageError, match=r"local port.*Permission denied"):
         loopback_login(http(FakeDrive()), SETTINGS, opened.append, timeout=1)
     assert opened == []
+
+
 def test_a_silent_preconnect_does_not_starve_the_real_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
