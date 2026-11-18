@@ -10,7 +10,13 @@ from pathlib import Path
 
 from drive_artifacts.archive import sha256_file
 from drive_artifacts.drive import DriveClient, DriveFile
-from drive_artifacts.errors import DriveArtifactsError, DriveError, IntegrityError, UsageError
+from drive_artifacts.errors import (
+    ConflictError,
+    DriveArtifactsError,
+    DriveError,
+    IntegrityError,
+    UsageError,
+)
 from drive_artifacts.model import (
     FOLDER_MIME,
     ArtifactKey,
@@ -27,6 +33,13 @@ from drive_artifacts.model import (
 )
 
 MAX_RETENTION_DAYS = 400
+
+
+def validate_retention_days(days: int) -> int:
+    """The one rule for how long an artifact may be kept; the CLI and the store both use it."""
+    if not 1 <= days <= MAX_RETENTION_DAYS:
+        raise UsageError(f"retention days must be 1..{MAX_RETENTION_DAYS}, got {days}")
+    return days
 
 
 def _utc_today() -> date:
@@ -126,18 +139,13 @@ class ArtifactStore:
         overwrite: bool = False,
     ) -> ArtifactRecord:
         name = validate_artifact_name(name)
-        if not 1 <= retention_days <= MAX_RETENTION_DAYS:
-            raise UsageError(
-                f"retention days must be 1..{MAX_RETENTION_DAYS}, got {retention_days}"
-            )
+        validate_retention_days(retention_days)
         key = ArtifactKey(ctx.repo.id, ctx.run_id, ctx.run_attempt, name)
         existing = self.find(key)
         if existing is not None and not overwrite:
-            raise DriveError(
+            raise ConflictError(
                 f"artifact {name!r} already exists for run {ctx.run_id} attempt {ctx.run_attempt} "
-                f"(Drive file {existing.file_id}); pass overwrite to replace it",
-                status=409,
-                reason="conflict",
+                f"(Drive file {existing.file_id}); pass overwrite to replace it"
             )
         folder = self.repo_folder(ctx.repo, create=True)
         if folder is None:  # pragma: no cover - create=True never yields None

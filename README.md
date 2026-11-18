@@ -164,7 +164,7 @@ app client with the `drive.file` scope, consent screen In production) before
 ## Exit codes
 
 `0` ok · `1` filesystem error · `2` usage · `3` authentication · `4` not found ·
-`5` Drive error after retries · `6` integrity (digest or unsafe zip) ·
+`5` Drive error after retries, or the artifact already exists and `overwrite` is off · `6` integrity (digest or unsafe zip) ·
 `7` `if-no-files-found: error`.
 
 ## Development
