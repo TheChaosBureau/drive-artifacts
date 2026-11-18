@@ -353,3 +353,89 @@ def test_revoke_wraps_undecodable_responses() -> None:
     client = httpx.Client(transport=httpx.MockTransport(_undecodable))
     with pytest.raises(AuthError, match="DecodingError"):
         revoke(client, SETTINGS, "rt-1")
+
+
+def test_a_silent_preconnect_does_not_starve_the_real_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Browsers open speculative connections that never send a request. The loopback server
+    takes one connection at a time, so each one may hold it only briefly."""
+    monkeypatch.setattr("drive_artifacts.oauth.CONNECTION_READ_TIMEOUT_S", 0.3)
+    fake = FakeDrive()
+    held: list[socket.socket] = []
+
+    def open_browser(url: str) -> None:
+        q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+        redirect = q["redirect_uri"]
+        held.append(socket.create_connection(("127.0.0.1", urlparse(redirect).port or 0)))
+        real = {"code": fake.issue_auth_code(q["code_challenge"]), "state": q["state"]}
+        threading.Thread(
+            target=lambda: httpx.get(redirect, params=real, timeout=20), daemon=True
+        ).start()
+
+    started = time.monotonic()
+    try:
+        stored = loopback_login(http(fake), SETTINGS, open_browser, timeout=8)
+    finally:
+        for sock in held:
+            sock.close()
+    assert stored.refresh_token in fake.refresh_tokens
+    assert time.monotonic() - started < 4
+
+
+def test_a_redirect_that_is_not_a_get_is_named_in_the_timeout() -> None:
+    def open_browser(url: str) -> None:
+        q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+        params = {"code": "posted", "state": q["state"]}
+        threading.Thread(
+            target=lambda: httpx.post(q["redirect_uri"], params=params, timeout=5), daemon=True
+        ).start()
+
+    with pytest.raises(AuthError, match=r"timed out.*POST request was refused"):
+        loopback_login(http(FakeDrive()), SETTINGS, open_browser, timeout=1)
+
+
+def _login_page(params_for: Callable[[dict[str, str]], dict[str, str]]) -> tuple[str, str]:
+    """Run a login whose redirect carries `params_for(query)`; return (page text, error text)."""
+    pages: list[str] = []
+
+    def open_browser(url: str) -> None:
+        q = {k: v[0] for k, v in parse_qs(urlparse(url).query).items()}
+        threading.Thread(
+            target=lambda: pages.append(
+                httpx.get(q["redirect_uri"], params=params_for(q), timeout=5).text
+            ),
+            daemon=True,
+        ).start()
+
+    with pytest.raises(AuthError) as caught:
+        loopback_login(http(FakeDrive()), SETTINGS, open_browser, timeout=10)
+    deadline = time.monotonic() + 5
+    while not pages and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return pages[0], str(caught.value)
+
+
+def test_the_browser_page_reports_a_denied_login_instead_of_success() -> None:
+    page, error = _login_page(lambda q: {"error": "access_denied<script>", "state": q["state"]})
+    assert "access_denied" in error
+    assert "close this tab" not in page
+    assert "login failed" in page
+    assert "access_denied&lt;script&gt;" in page  # the value is escaped, never echoed raw
+    assert "<script>" not in page
+
+
+def test_the_browser_page_reports_a_redirect_without_a_code() -> None:
+    page, error = _login_page(lambda q: {"state": q["state"]})
+    assert "no authorization code" in error
+    assert "close this tab" not in page
+    assert "login failed" in page
+
+
+def test_token_endpoint_429_is_retried() -> None:
+    fake = FakeDrive()
+    fake.faults.append(Fault(status=429, method="POST", path="/token", count=2))
+    slept: list[float] = []
+    source = RefreshingTokenSource(http(fake), SETTINGS, STORED, sleep=slept.append)
+    assert source.access_token()
+    assert slept == [1.0, 2.0]
