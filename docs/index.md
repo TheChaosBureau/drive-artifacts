@@ -69,6 +69,12 @@ recoverable for 30 days.
 - A token unused for six months stops working. `drive-artifacts login` again.
 - Drive's trash empties itself after 30 days. Pruning never deletes permanently.
 - Your Drive quota is the limit. Personal accounts start at 15 GB.
+- Links: a link to a file is stored as that file under the link's name. A link to a
+  directory is followed only when `path` names it; wildcards and directory walks do not go
+  through one. A broken link is left out.
+- A file whose name holds a backslash or starts like a Windows drive (`C:`) cannot be
+  uploaded, because extraction would refuse it; and every path must lie inside the
+  directories the patterns search (no `a/*/../../b`).
 - Two jobs that upload the same name in the same run with `overwrite: true` at the same
   moment both succeed, and the later upload is the one that stays. The earlier job's
   outputs then point at a file that is in the trash. Give parallel jobs different names.
