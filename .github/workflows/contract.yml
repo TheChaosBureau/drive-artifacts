@@ -36,9 +36,9 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.13"
-      - run: uv sync --all-groups
+      - run: uv sync --no-default-groups --group test
       - env:
           DRIVE_ARTIFACTS_TOKEN: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
           DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
           DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
-        run: uv run pytest tests/contract -m contract -q -ra
+        run: uv run --no-sync pytest tests/contract -m contract -q -ra

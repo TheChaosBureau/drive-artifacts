@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
 import time
+from collections.abc import Iterator
 
 import httpx
 import pytest
@@ -871,3 +872,83 @@ def test_a_chunk_that_does_not_start_where_the_session_stands_is_400() -> None:
     again = c.put(session, content=b"abcd", headers={"Content-Range": "bytes 0-3/8"})
     assert again.status_code == 400
     assert "server has 4" in again.json()["error"]["message"]
+
+
+# ----- the fake behind a socket, and faults that must not be wasted ----------------------------
+
+
+def test_a_cut_after_fault_waits_for_a_download_it_can_cut() -> None:
+    """A fault scheduled for a download is not spent on a 404, a 401 or a 416 that happens to
+    match it first."""
+    fake = FakeDrive()
+    fid = fake.add_file("a", b"0123456789")
+    c = client(fake)
+    fake.faults.append(Fault(method="GET", path="alt=media", cut_after=3))
+    assert c.get(f"{API}/drive/v3/files/missing", params={"alt": "media"}).status_code == 404
+    assert (
+        client(fake, "stale").get(f"{API}/drive/v3/files/{fid}", params={"alt": "media"})
+    ).status_code == 401
+    past_the_end = c.get(
+        f"{API}/drive/v3/files/{fid}", params={"alt": "media"}, headers={"Range": "bytes=99-"}
+    )
+    assert past_the_end.status_code == 416
+    assert len(fake.faults) == 1  # still waiting
+    with pytest.raises(httpx.ReadError):
+        c.get(f"{API}/drive/v3/files/{fid}", params={"alt": "media"})
+    assert fake.faults == []
+
+
+def test_two_servers_over_one_fake_share_its_lock() -> None:
+    """The fake is not thread-safe; whatever serves it must take the one lock it owns."""
+    fake = FakeDrive()
+    taken: list[str] = []
+    real = fake.lock
+
+    class Counting:
+        def __enter__(self) -> None:
+            real.acquire()
+            taken.append("in")
+
+        def __exit__(self, *_exc: object) -> None:
+            real.release()
+
+    fake.lock = Counting()  # type: ignore[assignment]
+    with serve(fake) as one, serve(fake) as two:
+        for base in (one, two):
+            r = httpx.get(f"{base}/api/drive/v3/files", headers={"Authorization": "Bearer at-1"})
+            assert r.status_code == 200
+    assert len(taken) == 2
+
+
+def test_the_http_server_refuses_a_body_it_would_read_as_empty() -> None:
+    """It reads bodies by Content-Length. A chunked body must fail loudly, not arrive empty."""
+    fake = FakeDrive()
+
+    def pieces() -> Iterator[bytes]:
+        yield b'{"name": '
+        yield b'"chunked"}'
+
+    with serve(fake) as base:
+        r = httpx.post(
+            f"{base}/api/drive/v3/files",
+            content=pieces(),
+            headers={"Authorization": "Bearer at-1", "Content-Type": "application/json"},
+        )
+    assert r.status_code == 411
+    assert "Content-Length" in r.text
+    assert fake.live_files() == []
+    assert fake.requests == []  # never reached the fake
+
+
+def test_faults_match_over_http_as_they_do_in_process() -> None:
+    """The server strips its `/api` and `/oauth` prefixes before the fake sees the request."""
+    fake = FakeDrive()
+    fid = fake.add_file("a", b"x")
+    fake.faults.append(Fault(status=500, method="GET", path=fid))
+    fake.faults.append(Fault(status=503, path="/token"))
+    with serve(fake) as base:
+        auth = {"Authorization": "Bearer at-1"}
+        assert httpx.get(f"{base}/api/drive/v3/files/{fid}", headers=auth).status_code == 500
+        assert httpx.get(f"{base}/api/drive/v3/files/{fid}", headers=auth).status_code == 200
+        assert httpx.post(f"{base}/oauth/token", data={}).status_code == 503
+    assert fake.faults == []

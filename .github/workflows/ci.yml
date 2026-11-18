@@ -68,8 +68,9 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python }}
-      - run: uv sync --all-groups
-      - run: uv run pytest --cov --cov-report=term --cov-report=xml -m "not contract"
+      # Only what the suite needs: the linters stay out of the test legs.
+      - run: uv sync --no-default-groups --group test
+      - run: uv run --no-sync pytest --cov --cov-report=term --cov-report=xml -m "not contract"
   test-cross:
     needs: static
     strategy:
@@ -87,5 +88,6 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python }}
-      - run: uv sync --all-groups
-      - run: uv run pytest --cov --cov-report=term --cov-report=xml -m "not contract"
+      # Only what the suite needs: the linters stay out of the test legs.
+      - run: uv sync --no-default-groups --group test
+      - run: uv run --no-sync pytest --cov --cov-report=term --cov-report=xml -m "not contract"

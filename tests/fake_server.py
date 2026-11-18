@@ -16,9 +16,8 @@ from tests.fake_drive import CutStream, FakeDrive
 
 
 def _handler_class(fake: FakeDrive) -> type[BaseHTTPRequestHandler]:
-    # The server is threaded; the fake (fault list, counters, files) is not.
-    lock = threading.Lock()
-
+    # The server is threaded; the fake (fault list, counters, files) is not. The lock is the
+    # fake's own, so two servers over one fake still take turns.
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -34,6 +33,17 @@ def _handler_class(fake: FakeDrive) -> type[BaseHTTPRequestHandler]:
                 self.connection.shutdown(socket.SHUT_RDWR)
 
         def _serve(self) -> None:
+            if self.headers.get("Transfer-Encoding"):
+                # Bodies are read by Content-Length only. A chunked one would arrive empty and
+                # be acted on; refuse it where the mistake is visible.
+                message = b"this test server reads bodies by Content-Length only"
+                self.send_response(411)
+                self.send_header("Content-Length", str(len(message)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(message)
+                self.close_connection = True
+                return
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
             path = self.path
@@ -44,7 +54,7 @@ def _handler_class(fake: FakeDrive) -> type[BaseHTTPRequestHandler]:
                 self.command, url, headers=dict(self.headers.items()), content=body
             )
             try:
-                with lock:
+                with fake.lock:
                     response = fake.handler(request)
             except httpx.ConnectError:
                 self._hang_up()  # an injected drop
