@@ -35,21 +35,36 @@ inputs:
   prune:
     description: Trash this repository's expired artifacts after the upload.
     default: "true"
+  latest:
+    description: >-
+      Store the one file `path` matches as a plain file at a fixed path and replace it in place
+      on every upload: not zipped, no expiry, one Drive link that never changes. Runs only on
+      the default branch. `name`, `retention-days`, `compression-level`, `overwrite` and `prune`
+      do not apply.
+    default: "false"
+  latest-path:
+    description: >-
+      With `latest`: the path under the root folder; a trailing slash keeps the file's own name.
+      Empty means Latest/<owner>/<repo>/<file name>.
+    default: ""
+  latest-any-ref:
+    description: With `latest`, allow a ref that is not the default branch to replace the file.
+    default: "false"
   source:
     description: The requirement uvx installs. Leave at the default.
     default: drive-artifacts==0.1.0
 outputs:
   artifact-id:
-    description: Drive file id of the uploaded zip.
+    description: Drive file id of the uploaded zip, or of the latest file (it never changes).
     value: ${{ steps.upload.outputs.artifact-id }}
   artifact-url:
-    description: Drive link to the uploaded zip.
+    description: Drive link to the uploaded zip, or to the latest file (it never changes).
     value: ${{ steps.upload.outputs.artifact-url }}
   artifact-digest:
-    description: sha256 of the uploaded zip, prefixed `sha256:`.
+    description: sha256 of the uploaded zip or latest file, prefixed `sha256:`.
     value: ${{ steps.upload.outputs.artifact-digest }}
   size:
-    description: Size of the zip in bytes.
+    description: Size of the zip or latest file in bytes.
     value: ${{ steps.upload.outputs.size }}
 runs:
   using: composite
@@ -71,30 +86,45 @@ runs:
         DA_OVERWRITE: ${{ inputs.overwrite }}
         DA_INCLUDE_HIDDEN: ${{ inputs.include-hidden-files }}
         DA_PRUNE: ${{ inputs.prune }}
+        DA_LATEST: ${{ inputs.latest }}
+        DA_LATEST_PATH: ${{ inputs.latest-path }}
+        DA_LATEST_ANY_REF: ${{ inputs.latest-any-ref }}
         PYTHONUTF8: "1" # a Windows console is not UTF-8; artifact names may be
       run: |
-        # `--option=value`, so a value that starts with a dash is never read as an option.
-        args=(upload --name="$DA_NAME" --path="$DA_PATH"
-              --retention-days="$DA_RETENTION_DAYS"
-              --if-no-files-found="$DA_IF_NO_FILES_FOUND"
-              --compression-level="$DA_COMPRESSION_LEVEL")
         # Workflow-command escaping, so an input value cannot end the line and start a command.
         esc() { local v=$1; v=${v//'%'/%25}; v=${v//$'\r'/%0D}; v=${v//$'\n'/%0A}; printf '%s' "$v"; }
-        # Booleans as actions/upload-artifact reads them (YAML 1.2 core schema); anything else fails.
-        case "$DA_OVERWRITE" in
-          true|True|TRUE) args+=(--overwrite) ;;
-          false|False|FALSE) ;;
-          *) echo "::error::overwrite must be true or false, got '$(esc "$DA_OVERWRITE")'"; exit 2 ;;
-        esac
-        case "$DA_INCLUDE_HIDDEN" in
-          true|True|TRUE) args+=(--include-hidden-files) ;;
-          false|False|FALSE) ;;
-          *) echo "::error::include-hidden-files must be true or false, got '$(esc "$DA_INCLUDE_HIDDEN")'"; exit 2 ;;
-        esac
-        case "$DA_PRUNE" in
-          true|True|TRUE) ;;
-          false|False|FALSE) args+=(--no-prune) ;;
-          *) echo "::error::prune must be true or false, got '$(esc "$DA_PRUNE")'"; exit 2 ;;
-        esac
+        # Booleans as actions/upload-artifact reads them (YAML 1.2 core schema); anything else
+        # fails. Every one is checked, whichever mode then uses it.
+        bool() {
+          case "$2" in
+            true|True|TRUE) return 0 ;;
+            false|False|FALSE) return 1 ;;
+            *) echo "::error::$1 must be true or false, got '$(esc "$2")'"; exit 2 ;;
+          esac
+        }
+        overwrite=false; hidden=false; prune=false; latest=false; any_ref=false
+        if bool overwrite "$DA_OVERWRITE"; then overwrite=true; fi
+        if bool include-hidden-files "$DA_INCLUDE_HIDDEN"; then hidden=true; fi
+        if bool prune "$DA_PRUNE"; then prune=true; fi
+        if bool latest "$DA_LATEST"; then latest=true; fi
+        if bool latest-any-ref "$DA_LATEST_ANY_REF"; then any_ref=true; fi
+        # `--option=value`, so a value that starts with a dash is never read as an option.
+        args=(upload --path="$DA_PATH" --if-no-files-found="$DA_IF_NO_FILES_FOUND")
+        if [ "$hidden" = true ]; then args+=(--include-hidden-files); fi
+        if [ "$latest" = true ]; then
+          # One plain file at a fixed path: the zip inputs have defaults, so they are left out
+          # here rather than refused.
+          args+=(--latest)
+          if [ -n "$DA_LATEST_PATH" ]; then args+=(--latest-path="$DA_LATEST_PATH"); fi
+          if [ "$any_ref" = true ]; then args+=(--any-ref); fi
+        else
+          if [ -n "$DA_LATEST_PATH" ] || [ "$any_ref" = true ]; then
+            echo "::error::latest-path and latest-any-ref need latest: true"; exit 2
+          fi
+          args+=(--name="$DA_NAME" --retention-days="$DA_RETENTION_DAYS"
+                 --compression-level="$DA_COMPRESSION_LEVEL")
+          if [ "$overwrite" = true ]; then args+=(--overwrite); fi
+          if [ "$prune" = false ]; then args+=(--no-prune); fi
+        fi
         # --no-config: the calling repository's uv.toml must not change how this installs.
         uvx --no-config --from "$DA_SOURCE" drive-artifacts "${args[@]}"

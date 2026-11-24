@@ -15,7 +15,7 @@ import pytest
 from drive_artifacts.archive import build_zip, resolve_paths, safe_extract, sha256_file
 from drive_artifacts.drive import DriveClient, DriveFile
 from drive_artifacts.errors import ConflictError, IntegrityError, NotFoundError
-from drive_artifacts.model import ArtifactKey, RunContext
+from drive_artifacts.model import ArtifactKey, RunContext, escape, query
 from drive_artifacts.oauth import RefreshingTokenSource, StoredToken
 from drive_artifacts.settings import Settings
 from drive_artifacts.store import ArtifactStore
@@ -99,6 +99,68 @@ def test_missing_and_tampered(
     with pytest.raises(IntegrityError):
         real_store.fetch(replace(record, sha256="0" * 64), dest)
     assert not dest.exists()  # a download that fails its digest is not left behind
+
+
+def test_a_latest_file_is_replaced_in_place_under_one_id_and_one_link(
+    real_store: ArtifactStore,
+    real_drive: DriveClient,
+    real_settings: Settings,
+    real_ctx: RunContext,
+    tmp_path: Path,
+) -> None:
+    """Two uploads to one path leave one Drive file: same id, same link, the second content.
+    Also what only Google can say: Drive keeps the first content as an earlier revision."""
+    folders = ("Latest", "contract")
+    src = tmp_path / "paper.pdf"
+    one, two = b"%PDF-1.7 first", b"%PDF-1.7 second, and longer"
+    src.write_bytes(one)
+    first = real_store.put_latest(real_ctx, src, folders=folders, name="paper.pdf")
+    assert first.size == len(one)
+    assert first.web_view_link
+    src.write_bytes(two)
+    later = replace(real_ctx, commit="1" * 40)
+    second = real_store.put_latest(later, src, folders=folders, name="paper.pdf")
+    assert second.file_id == first.file_id
+    assert second.web_view_link == first.web_view_link
+    assert second.created_time == first.created_time
+    assert (second.size, second.commit, second.sha256) == (len(two), "1" * 40, sha256_file(src))
+    back = tmp_path / "back.pdf"
+    real_drive.download_file(second.file_id, back, expected_size=len(two))
+    assert back.read_bytes() == two
+    # Exactly one file in the folder, and the listing reports it with its source.
+    stored = real_drive.get_file(second.file_id)
+    assert stored.name == "paper.pdf"
+    assert stored.mime_type == "application/pdf"
+    (parent,) = stored.parents
+    siblings = real_drive.list_files(query(f"'{escape(parent)}' in parents"))
+    assert [f.id for f in siblings] == [first.file_id]
+    (listed,) = [
+        r for r in real_store.list_latest(repo_id=real_ctx.repo.id) if r.path == second.path
+    ]
+    assert listed.file_id == first.file_id
+    assert listed.path == "Latest/contract/paper.pdf"
+    assert (listed.commit, listed.ref, listed.run_id) == ("1" * 40, real_ctx.ref, real_ctx.run_id)
+    assert (listed.repo, listed.uploaded) == (real_ctx.repo.slug, second.uploaded)
+    assert listed in real_store.list_latest()
+    # The earlier content stays as a revision of the same file (Drive prunes old revisions of
+    # such files on its own; `keepForever` is not set). If this changes, the README's
+    # sentence about revisions changes with it.
+    with httpx.Client() as http:
+        tokens = RefreshingTokenSource(
+            http, real_settings, StoredToken.parse(real_settings.token_text or "")
+        )
+        response = http.get(
+            f"{real_settings.api_base}/files/{second.file_id}/revisions",
+            params={"fields": "revisions(id,size,keepForever)"},
+            headers={"Authorization": f"Bearer {tokens.access_token()}"},
+            timeout=60,
+        )
+    assert response.status_code == 200, response.text
+    revisions = response.json()["revisions"]
+    assert [(r["size"], r.get("keepForever", False)) for r in revisions] == [
+        (str(len(one)), False),
+        (str(len(two)), False),
+    ]
 
 
 PROBE = bytes(range(250)) * 4

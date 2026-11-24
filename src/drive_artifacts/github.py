@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import secrets
 from collections.abc import Mapping
 from pathlib import Path
@@ -51,6 +52,21 @@ def read_run_context(
         ref=_pick(ref, env, "GITHUB_REF") or "",
         commit=_pick(commit, env, "GITHUB_SHA") or "",
     )
+
+
+def default_branch(env: Mapping[str, str]) -> str | None:
+    """The repository's default branch as the event payload of this run names it, or `None`
+    outside Actions or when the payload does not say."""
+    path = env.get("GITHUB_EVENT_PATH", "")
+    if not path:
+        return None
+    try:
+        event = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    repository = event.get("repository") if isinstance(event, dict) else None
+    branch = repository.get("default_branch") if isinstance(repository, dict) else None
+    return branch if isinstance(branch, str) and branch else None
 
 
 def _encode(message: str) -> str:

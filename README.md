@@ -63,6 +63,96 @@ in your Drive, and revoking the app at <https://myaccount.google.com/permissions
 ends its access instantly. Expired artifacts go to Drive's trash, where they stay
 recoverable for 30 days.
 
+## A latest copy at a link that never changes
+
+For a file people open rather than download, a rendered paper or a report, the
+upload action has a second mode. `latest: true` stores the one file `path`
+matches as a plain file, not zipped and with no expiry, at a fixed path under
+the root folder. The next upload to that path replaces the content of the same
+Drive file, so the file keeps its id and its link.
+
+```yaml
+on:
+  push:
+    branches: [main]
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: make paper                # writes paper/main.pdf
+      - uses: TheChaosBureau/drive-artifacts@v0
+        with:
+          path: paper/main.pdf
+          latest: true
+          token: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+```
+
+```
+GitHub Artifacts/
+  Latest/
+    you/
+      your-repo/
+        main.pdf        always the newest; one file, one link
+```
+
+- **Where.** `Latest/<owner>/<repo>/<file name>` under the root folder. Set
+  `latest-path` for another place: `Papers/` keeps the file's own name in that
+  folder, `Papers/index.html` also names the file. The path is the identity, so
+  a different path, a renamed repository on the default path, or a file moved
+  or renamed by hand in Drive, starts a new file with a new link.
+- **One file.** `path` must match exactly one file; several files take several
+  steps. `name`, `retention-days`, `compression-level`, `overwrite` and `prune`
+  belong to the zip mode and are not used here.
+- **Only the default branch.** The step fails on any other ref, a pull request
+  included, so that work in progress cannot replace the canonical file.
+  `latest-any-ref: true` lifts that. It is a guard against mistakes, not a
+  security boundary: whoever can edit the workflow can set the input.
+- **What the file says about itself.** Each upload records, as Drive app
+  properties on the file, the repository (id and `owner/name`), commit, ref,
+  run id and attempt, a sha256 of the content and the upload time in UTC.
+- **Reading them back.** `drive-artifacts latest --json` lists every latest
+  file the app can see, whichever repository uploaded it:
+
+  ```json
+  [
+    {
+      "path": "Latest/you/your-repo/main.pdf",
+      "name": "main.pdf",
+      "url": "https://drive.google.com/file/d/<id>/view?usp=drivesdk",
+      "file_id": "<id>",
+      "repo": "you/your-repo",
+      "repo_id": "123456",
+      "commit": "<sha>",
+      "ref": "refs/heads/main",
+      "run_id": "987654321",
+      "run_attempt": "1",
+      "uploaded": "2026-11-24T06:00:00Z",
+      "sha256": "<digest>",
+      "size": 482113,
+      "created": "2026-11-20T10:00:00.000Z",
+      "modified": "2026-11-24T06:00:01.000Z"
+    }
+  ]
+  ```
+
+  It needs only `DRIVE_ARTIFACTS_TOKEN`; `--repo-id` narrows it to one
+  repository. From Python: `ArtifactStore.list_latest()`.
+- **One listing for every repository.** What a token can see is decided by the
+  app and the Google account, not by the token: a token made by `login` for one
+  repository lists, and can replace, the latest files uploaded with a token
+  made for another, as long as both logins used the same Google account and
+  the same OAuth client. Tested against the real Drive with two tokens from two
+  separate logins. So one index can read every repository's files, and one
+  token can serve many repositories: `drive-artifacts login --org your-org`
+  stores it as an organisation secret (for `gh`, visible to the organisation's
+  private repositories by default; GitHub Free does not hand organisation
+  secrets to private repositories).
+- **Earlier versions.** Drive keeps the replaced content as an earlier revision
+  of the same file (*File information → Manage versions*), and removes old
+  revisions on its own schedule; the action does not pin them. The nightly
+  contract test checks this against the real Drive.
+
 ## Inputs
 
 ### Upload (`TheChaosBureau/drive-artifacts@v0`)
@@ -79,9 +169,14 @@ recoverable for 30 days.
 | `include-hidden-files` | `false` | include dot-files and dot-directories; a hidden directory that `path` names itself (`.cache/out/*`) is always searched |
 | `root` | `GitHub Artifacts` | the folder the app owns |
 | `prune` | `true` | trash this repository's expired artifacts after the upload; a failure here is a warning, the upload still succeeds |
+| `latest` | `false` | store one plain file at a fixed path and replace it in place; see above |
+| `latest-path` | `Latest/<owner>/<repo>/<file name>` | with `latest`: the path under the root folder; a trailing `/` keeps the file's own name |
+| `latest-any-ref` | `false` | with `latest`: allow a ref that is not the default branch |
 | `source` | `drive-artifacts==<this release>` | the requirement `uvx` installs; leave it alone |
 
 Outputs: `artifact-id`, `artifact-url`, `artifact-digest` (`sha256:…`), `size`.
+With `latest`, the id and the url are those of the one file and stay the same
+from upload to upload.
 
 ### Download (`TheChaosBureau/drive-artifacts/download@v0`)
 
@@ -108,6 +203,8 @@ drive-artifacts login --repo you/your-repo      # or --org your-org, or --print
 drive-artifacts upload --name wheel --path dist/
 drive-artifacts download --name wheel --run-id 123
 drive-artifacts list                            # this run; or --run-id 123, --ref REF, --all
+drive-artifacts upload --latest --path paper/main.pdf
+drive-artifacts latest --json                   # every latest file, with link and source
 drive-artifacts prune --dry-run
 drive-artifacts whoami
 drive-artifacts logout
@@ -125,6 +222,9 @@ drive-artifacts logout
 - `logout` revokes the app's access at Google. Assume it ends every token minted
   from the same Google account, not only the one in `DRIVE_ARTIFACTS_TOKEN`:
   other repositories that share the account may have to `login` again.
+- `upload --latest` takes `--latest-path` and `--any-ref`, and refuses the zip
+  options. It reads the default branch from the Actions event; elsewhere pass
+  `--default-branch` (with `--ref`), or `--any-ref`.
 - `list` shows one run by default; `--run-id` picks another run, `--ref` every
   artifact stored for a ref and `--all` every artifact of the repository, newest
   first.

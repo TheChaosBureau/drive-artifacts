@@ -26,6 +26,8 @@ RESERVED_NAMES = frozenset({".", ".."})
 # stored as a digest instead of failing the upload. 117 is the controller's ruling.
 REF_MAX_BYTES = 117
 REF_DIGEST_PREFIX = "sha256:"
+LATEST_FOLDER = "Latest"  # under the root: where "latest" files go unless a path is given
+DEFAULT_MIME = "application/octet-stream"
 
 
 def _utf8_len(text: str, what: str) -> int:
@@ -169,6 +171,117 @@ class ArtifactRecord:
         }
 
 
+def _path_step(step: str) -> str:
+    """One folder or file name of a "latest" path, or a `UsageError` saying what is wrong with it."""
+    if not step or step != step.strip():
+        raise UsageError("a latest path must not hold an empty step or one with outer spaces")
+    if step in RESERVED_NAMES:
+        raise UsageError(f"a latest path must not hold the step {step!r}")
+    if "\\" in step or any(ord(ch) < 32 or ord(ch) == 127 for ch in step):
+        raise UsageError(f"a latest path step holds a backslash or a control character: {step!r}")
+    _utf8_len(step, "latest path")
+    return step
+
+
+def latest_location(spec: str | None, repo_slug: str, filename: str) -> tuple[tuple[str, ...], str]:
+    """Where a "latest" file goes under the root: its folders, outermost first, and its name.
+
+    Without `spec` that is `Latest/<owner>/<repo>/<filename>`. A `spec` is a `/`-separated path
+    relative to the root; one that ends in `/` names a folder, and the file keeps its own name.
+    """
+    if spec is None or not spec.strip():
+        steps = [LATEST_FOLDER, *repo_slug.split("/"), filename]
+    else:
+        spec = spec.strip()
+        steps = spec.split("/")
+        if spec.endswith("/"):
+            steps[-1] = filename
+    checked = tuple(_path_step(step) for step in steps)
+    return checked[:-1], checked[-1]
+
+
+@dataclass(frozen=True, slots=True)
+class LatestRecord:
+    """One "latest" file as read back from Drive: where it is, what it was built from and when
+    it was last replaced."""
+
+    file_id: str
+    name: str
+    folder: str  # the folders under the root, joined with `/`; empty for the root itself
+    repo_id: str
+    repo: str  # owner/name at the time of the upload
+    run_id: str
+    run_attempt: str
+    ref: str
+    commit: str
+    sha256: str
+    uploaded: str  # UTC, ISO 8601: when the content was last replaced
+    size: int
+    web_view_link: str
+    created_time: str
+    modified_time: str
+
+    @property
+    def path(self) -> str:
+        """The path under the root, file name included."""
+        return f"{self.folder}/{self.name}" if self.folder else self.name
+
+    @classmethod
+    def from_drive(cls, file: Mapping[str, object]) -> LatestRecord:
+        """Parse a Drive file resource; every failure is a `ValueError` carrying the file id, as
+        with `ArtifactRecord.from_drive`."""
+        props = file.get("appProperties")
+        if (
+            not isinstance(props, Mapping)
+            or props.get("da.kind") != "latest"
+            or props.get("da.v") != SCHEMA_VERSION
+        ):
+            raise ValueError(f"not a drive-artifacts latest file: {file.get('id')!r}")
+        p: Mapping[str, str] = props
+        try:
+            return cls(
+                file_id=str(file["id"]),
+                name=str(file["name"]),
+                folder=p["da.dir"],
+                repo_id=p["da.repo"],
+                repo=p["da.slug"],
+                run_id=p["da.run"],
+                run_attempt=p["da.attempt"],
+                ref=p.get("da.ref", ""),
+                commit=p.get("da.commit", ""),
+                sha256=p["da.sha256"],
+                uploaded=p["da.uploaded"],
+                size=int(str(file.get("size", "0"))),
+                web_view_link=str(file.get("webViewLink", "")),
+                created_time=str(file.get("createdTime", "")),
+                modified_time=str(file.get("modifiedTime", "")),
+            )
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"malformed drive-artifacts latest file {file.get('id')!r}: {exc}"
+            ) from exc
+
+    def to_json(self) -> dict[str, object]:
+        """The record as the CLI prints it with `--json`."""
+        return {
+            "path": self.path,
+            "name": self.name,
+            "url": self.web_view_link,
+            "file_id": self.file_id,
+            "repo": self.repo,
+            "repo_id": self.repo_id,
+            "commit": self.commit,
+            "ref": self.ref,
+            "run_id": self.run_id,
+            "run_attempt": self.run_attempt,
+            "uploaded": self.uploaded,
+            "sha256": self.sha256,
+            "size": self.size,
+            "created": self.created_time,
+            "modified": self.modified_time,
+        }
+
+
 def check_properties(props: Mapping[str, str]) -> dict[str, str]:
     """Refuse a property whose key and value together exceed Drive's limit; return a copy."""
     for key, value in props.items():
@@ -199,8 +312,33 @@ def artifact_properties(
     )
 
 
-def folder_properties(kind: Literal["root", "repo"], repo_id: str | None = None) -> dict[str, str]:
-    """The `appProperties` of the root folder, or of one repository's folder."""
+def latest_properties(
+    ctx: RunContext, *, folder: str, sha256: str, uploaded: str
+) -> dict[str, str]:
+    """The `appProperties` that make a Drive file a "latest" file: where it sits under the root,
+    and the repository, run, ref, commit, digest and time of the upload that last replaced it."""
+    return check_properties(
+        {
+            "da.v": SCHEMA_VERSION,
+            "da.kind": "latest",
+            "da.dir": folder,
+            "da.repo": ctx.repo.id,
+            "da.slug": ctx.repo.slug,
+            "da.run": ctx.run_id,
+            "da.attempt": ctx.run_attempt,
+            "da.ref": fit_ref(ctx.ref),
+            "da.commit": ctx.commit,
+            "da.sha256": sha256,
+            "da.uploaded": uploaded,
+        }
+    )
+
+
+def folder_properties(
+    kind: Literal["root", "repo", "dir"], repo_id: str | None = None
+) -> dict[str, str]:
+    """The `appProperties` of the root folder, of one repository's folder, or of a folder on a
+    "latest" path."""
     props = {"da.v": SCHEMA_VERSION, "da.kind": kind}
     if kind == "repo":
         if repo_id is None:
