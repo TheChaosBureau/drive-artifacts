@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-24
+
 ### Added
 
 - A "latest" mode for the upload action (`latest: true`) and the CLI (`upload --latest`):
@@ -28,5 +30,6 @@ All notable changes to this project are documented here. The format follows
 - Retention days with pruning, overwrite, `if-no-files-found`, hidden-file handling.
 - `drive.file`-only OAuth with a shipped desktop client; token stored as a GitHub secret.
 
-[Unreleased]: https://github.com/TheChaosBureau/drive-artifacts/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/TheChaosBureau/drive-artifacts/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/TheChaosBureau/drive-artifacts/releases/tag/v0.2.0
 [0.1.0]: https://github.com/TheChaosBureau/drive-artifacts/releases/tag/v0.1.0
