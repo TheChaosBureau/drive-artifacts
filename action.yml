@@ -52,7 +52,7 @@ inputs:
     default: "false"
   source:
     description: The requirement uvx installs. Leave at the default.
-    default: drive-artifacts==0.1.0
+    default: drive-artifacts==0.2.0
 outputs:
   artifact-id:
     description: Drive file id of the uploaded zip, or of the latest file (it never changes).

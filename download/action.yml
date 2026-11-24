@@ -28,7 +28,7 @@ inputs:
     default: GitHub Artifacts
   source:
     description: The requirement uvx installs. Leave at the default.
-    default: drive-artifacts==0.1.0
+    default: drive-artifacts==0.2.0
 outputs:
   download-path:
     description: Absolute path of the directory the artifact(s) were extracted into.
