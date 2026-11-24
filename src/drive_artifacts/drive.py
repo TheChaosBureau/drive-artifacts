@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The six Drive calls this package makes, with retries, resumable uploads and ranged downloads."""
+"""The seven Drive calls this package makes, with retries, resumable uploads and ranged downloads."""
 
 from __future__ import annotations
 
@@ -62,7 +62,7 @@ class DriveFile:
         )
 
     def as_mapping(self) -> dict[str, object]:
-        """Back to the shape of a Drive file resource, as `ArtifactRecord.from_drive` reads it."""
+        """Back to the shape of a Drive file resource, as the records' `from_drive` read it."""
         return {
             "id": self.id,
             "name": self.name,
@@ -380,7 +380,6 @@ class DriveClient:
     ) -> DriveFile:
         """Upload `path` in resumable chunks and return the stored file. A session that expired
         is reopened once."""
-        total = path.stat().st_size
         meta: dict[str, object] = {
             "name": name,
             "mimeType": mime,
@@ -388,10 +387,33 @@ class DriveClient:
         }
         if parent:
             meta["parents"] = [parent]
+        return self._resumable("POST", f"{self._upload}/files", meta, path, mime)
+
+    def update_file(
+        self,
+        file_id: str,
+        path: Path,
+        *,
+        app_properties: Mapping[str, str],
+        mime: str,
+    ) -> DriveFile:
+        """Replace the content of an existing file with `path`, in resumable chunks, and return
+        the stored file. Its id, link, name and folder stay as they are; `app_properties` are
+        set on it (keys it already has and that are not named here are kept). Raises
+        `NotFoundError` when Drive has no such file."""
+        meta: dict[str, object] = {"mimeType": mime, "appProperties": dict(app_properties)}
+        return self._resumable("PATCH", f"{self._upload}/files/{file_id}", meta, path, mime)
+
+    def _resumable(
+        self, method: str, url: str, meta: Mapping[str, object], path: Path, mime: str
+    ) -> DriveFile:
+        """Open a resumable session (`POST` creates a file, `PATCH` replaces one's content) and
+        send `path` through it. A session that expired is reopened once."""
+        total = path.stat().st_size
         for _restart in range(2):
             opened = self._request(
-                "POST",
-                f"{self._upload}/files",
+                method,
+                url,
                 params={"uploadType": "resumable", "fields": FIELDS},
                 json=meta,
                 headers={"X-Upload-Content-Type": mime, "X-Upload-Content-Length": str(total)},

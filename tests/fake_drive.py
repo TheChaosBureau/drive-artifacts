@@ -137,6 +137,7 @@ class _Session:
     expired: bool = False
     file_id: str | None = None
     fields: str | None = None  # of the opening POST: what the final answer carries
+    target_id: str | None = None  # set by an opening PATCH: the file whose content is replaced
 
 
 _TERM = re.compile(
@@ -417,6 +418,8 @@ class FakeDrive:
                 return self._start_session(request)
             if request.method == "PUT":
                 return self._put_chunk(request, truncate_to=None)
+            if request.method == "PATCH":
+                return self._start_update_session(request)
         m = re.search(r"/drive/v3/files(?:/([^/]+))?$", path)
         if m is None:
             return _error(404, "notFound", f"no route {path}")
@@ -645,6 +648,53 @@ class FakeDrive:
             200, headers={"Location": f"{base}?uploadType=resumable&upload_id={upload_id}"}
         )
 
+    def _start_update_session(self, request: httpx.Request) -> httpx.Response:
+        """`PATCH /upload/drive/v3/files/<id>?uploadType=resumable`: a session that replaces the
+        content of an existing file. The file keeps its id, link, parents and creation time."""
+        m = re.search(r"/upload/drive/v3/files/([^/]+)$", request.url.path)
+        target = self.files.get(m.group(1)) if m else None
+        if target is None:
+            return _error(404, "notFound", "File not found.")
+        if target.mime_type == FOLDER:
+            return _error(403, "fileNotWritable", "a folder has no content to replace")
+        meta = json.loads(request.content) if request.content else {}
+        unmodelled = sorted(set(meta) - {"name", "mimeType", "appProperties"})
+        if unmodelled:
+            return _error(
+                400, "badRequest", f"the fake does not model changing {', '.join(unmodelled)}"
+            )
+        length = request.headers.get("X-Upload-Content-Length")
+        upload_id = self._next("upload-")
+        self.sessions[upload_id] = _Session(
+            metadata=meta,
+            total=int(length) if length else None,
+            fields=request.url.params.get("fields"),
+            target_id=target.id,
+        )
+        base = f"{request.url.scheme}://{request.url.netloc.decode()}/upload/drive/v3/files"
+        return httpx.Response(
+            200, headers={"Location": f"{base}?uploadType=resumable&upload_id={upload_id}"}
+        )
+
+    def _replace(self, session: _Session, content: bytes) -> FakeFile:
+        """Finish an update session. `appProperties` merge key by key, and a null deletes."""
+        f = self.files[session.target_id or ""]
+        meta = session.metadata
+        if "name" in meta:
+            f.name = str(meta["name"])
+        if "mimeType" in meta:
+            f.mime_type = str(meta["mimeType"])
+        props = meta.get("appProperties")
+        if isinstance(props, dict):
+            for key, value in props.items():
+                if value is None:
+                    f.app_properties.pop(str(key), None)
+                else:
+                    f.app_properties[str(key)] = str(value)
+        f.content = content
+        f.modified_time = self._now()
+        return f
+
     def _put_chunk(self, request: httpx.Request, *, truncate_to: int | None) -> httpx.Response:
         session = self.sessions.get(request.url.params.get("upload_id", ""))
         if session is None or session.expired:
@@ -678,7 +728,13 @@ class FakeDrive:
             session.received += body if truncate_to is None else body[:truncate_to]
         session.total = total
         if session.total is not None and len(session.received) >= session.total:
-            f = self._create(session.metadata, bytes(session.received[: session.total]))
+            content = bytes(session.received[: session.total])
+            if session.target_id is None:
+                f = self._create(session.metadata, content)
+            elif session.target_id not in self.files:
+                return _error(404, "notFound", "File not found.")
+            else:
+                f = self._replace(session, content)
             session.file_id = f.id
             return self._finished(f, session)
         headers = {"Range": f"bytes=0-{len(session.received) - 1}"} if session.received else {}

@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A "latest" mode for the upload action (`latest: true`) and the CLI (`upload --latest`):
+  one plain file, not zipped and with no expiry, at a fixed path under the root folder
+  (default `Latest/<owner>/<repo>/<file name>`, or `latest-path`). A later upload to the
+  same path replaces the content of the same Drive file, so its id and link stay the same.
+  The file records repository, commit, ref, run and upload time as app properties. The mode
+  runs only on the default branch unless `latest-any-ref` (`--any-ref`) is set.
+- `drive-artifacts latest` and `ArtifactStore.list_latest()` list every latest file the app
+  can see, with its link and those properties; `--json` for machines.
+
 ## [0.1.0] - 2026-11-18
 
 ### Added

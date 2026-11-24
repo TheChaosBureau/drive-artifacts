@@ -151,3 +151,82 @@ jobs:
           token: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
           source: ${{ github.workspace }}
       - run: grep -q "hello from $GITHUB_RUN_ID" latest/hello.txt
+  # The "latest" mode: two uploads to one path leave one plain file, under one id and one link,
+  # holding the second content; the listing reports it with this run's commit. On main the path
+  # is the default one and the default-branch rule applies as it does for a consumer. A manual
+  # dispatch from another branch uses a path of its own, so it never replaces main's file.
+  latest-file:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          mkdir out
+          echo "first from $GITHUB_RUN_ID" > out/e2e-latest.txt
+      - id: first
+        uses: ./ # zizmor: ignore[self-repository]
+        env: # only for a fork that tests against a client of its own; unset here
+          DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+          DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
+        with:
+          path: out/e2e-latest.txt
+          latest: true
+          latest-path: ${{ github.ref != 'refs/heads/main' && format('Branches/{0}/', github.ref_name) || '' }}
+          latest-any-ref: ${{ github.ref != 'refs/heads/main' }}
+          token: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+          source: ${{ github.workspace }}
+      - run: echo "second from $GITHUB_RUN_ID attempt $GITHUB_RUN_ATTEMPT, and longer" > out/e2e-latest.txt
+      - id: second
+        uses: ./ # zizmor: ignore[self-repository]
+        env: # only for a fork that tests against a client of its own; unset here
+          DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+          DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
+        with:
+          path: out/e2e-latest.txt
+          latest: true
+          latest-path: ${{ github.ref != 'refs/heads/main' && format('Branches/{0}/', github.ref_name) || '' }}
+          latest-any-ref: ${{ github.ref != 'refs/heads/main' }}
+          token: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+          source: ${{ github.workspace }}
+      # The command line under test, run the way the action runs it (uv is on PATH from the
+      # action's own setup step). It gets the secrets a `./` step gets, and nothing else does.
+      - id: listing
+        env:
+          DRIVE_ARTIFACTS_TOKEN: ${{ secrets.DRIVE_ARTIFACTS_TOKEN }}
+          DRIVE_ARTIFACTS_CLIENT_ID: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_ID }}
+          DRIVE_ARTIFACTS_CLIENT_SECRET: ${{ secrets.DRIVE_ARTIFACTS_CLIENT_SECRET }}
+        run: uvx --no-config --from "$GITHUB_WORKSPACE" drive-artifacts latest --json > latest.json
+      - env:
+          FIRST_ID: ${{ steps.first.outputs.artifact-id }}
+          FIRST_URL: ${{ steps.first.outputs.artifact-url }}
+          SECOND_ID: ${{ steps.second.outputs.artifact-id }}
+          SECOND_URL: ${{ steps.second.outputs.artifact-url }}
+          SECOND_DIGEST: ${{ steps.second.outputs.artifact-digest }}
+          EXPECTED_PATH: ${{ github.ref != 'refs/heads/main' && format('Branches/{0}', github.ref_name) || format('Latest/{0}', github.repository) }}/e2e-latest.txt
+        run: |
+          test -n "$FIRST_ID"
+          test "$FIRST_ID" = "$SECOND_ID"
+          test "$FIRST_URL" = "$SECOND_URL"
+          test "$SECOND_DIGEST" = "sha256:$(sha256sum out/e2e-latest.txt | cut -d' ' -f1)"
+          python3 - <<'PY'
+          import json, os
+
+          env = os.environ
+          entries = json.load(open("latest.json", encoding="utf-8"))
+          at_path = [e for e in entries if e["path"] == env["EXPECTED_PATH"]]
+          assert len(at_path) == 1, f"{len(at_path)} files at {env['EXPECTED_PATH']}"
+          (entry,) = at_path
+          assert entry["file_id"] == env["SECOND_ID"], entry
+          assert entry["url"] == env["SECOND_URL"], entry
+          assert "sha256:" + entry["sha256"] == env["SECOND_DIGEST"], entry
+          assert entry["commit"] == env["GITHUB_SHA"], entry
+          assert entry["ref"] == env["GITHUB_REF"], entry
+          assert entry["run_id"] == env["GITHUB_RUN_ID"], entry
+          assert entry["repo"] == env["GITHUB_REPOSITORY"], entry
+          assert entry["uploaded"].endswith("Z"), entry
+          print(f"one file at {entry['path']}, uploaded {entry['uploaded']} from {entry['commit']}")
+          PY

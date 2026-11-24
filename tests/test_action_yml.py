@@ -33,6 +33,9 @@ def test_upload_action_contract() -> None:
         "include-hidden-files",
         "root",
         "prune",
+        "latest",
+        "latest-path",
+        "latest-any-ref",
         "source",
     }
     assert set(a["outputs"]) == {"artifact-id", "artifact-url", "artifact-digest", "size"}
@@ -91,6 +94,9 @@ UPLOAD_ENV = {
     "DA_OVERWRITE": "false",
     "DA_INCLUDE_HIDDEN": "false",
     "DA_PRUNE": "true",
+    "DA_LATEST": "false",
+    "DA_LATEST_PATH": "",
+    "DA_LATEST_ANY_REF": "false",
 }
 DOWNLOAD_ENV = {"DA_NAME": "", "DA_PATH": ".", "DA_RUN_ID": "", "DA_REF": "", "DA_COMMIT": ""}
 
@@ -163,6 +169,8 @@ def test_boolean_inputs_take_every_yaml_spelling_of_true_and_false(
         ("DA_PRUNE", "prune"),
         ("DA_OVERWRITE", "overwrite"),
         ("DA_INCLUDE_HIDDEN", "include-hidden-files"),
+        ("DA_LATEST", "latest"),
+        ("DA_LATEST_ANY_REF", "latest-any-ref"),
     ],
 )
 @pytest.mark.parametrize("value", ["yes", "1", ""])
@@ -183,7 +191,65 @@ def test_the_upload_step_ignores_the_callers_uv_config_and_binds_values_to_their
     `uv.toml` must not change how the action installs itself."""
     result = _run_upload_step(tmp_path, DA_NAME="-x", DA_PATH="-rf\ndist/")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.startswith("\n".join([*CLI, "upload", "--name=-x", "--path=-rf", "dist/"]))
+    assert result.stdout.splitlines() == [
+        *CLI,
+        "upload",
+        "--path=-rf",  # a multi-line value stays one argument: the stub prints it on two lines
+        "dist/",
+        "--if-no-files-found=warn",
+        "--name=-x",
+        "--retention-days=90",
+        "--compression-level=6",
+    ]
+
+
+@needs_bash
+def test_the_latest_mode_passes_only_what_applies_to_one_plain_file(tmp_path: Path) -> None:
+    """The zip inputs always carry their defaults, so in latest mode they are left out: the CLI
+    refuses them next to `--latest`."""
+    result = _run_upload_step(tmp_path, DA_LATEST="true", DA_PATH="paper/main.pdf")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [
+        *CLI,
+        "upload",
+        "--path=paper/main.pdf",
+        "--if-no-files-found=warn",
+        "--latest",
+    ]
+    result = _run_upload_step(
+        tmp_path,
+        DA_LATEST="True",
+        DA_LATEST_PATH="-Papers/",
+        DA_LATEST_ANY_REF="TRUE",
+        DA_INCLUDE_HIDDEN="true",
+        DA_OVERWRITE="true",
+        DA_PRUNE="false",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [
+        *CLI,
+        "upload",
+        "--path=dist/",
+        "--if-no-files-found=warn",
+        "--include-hidden-files",
+        "--latest",
+        "--latest-path=-Papers/",
+        "--any-ref",
+    ]
+
+
+@needs_bash
+@pytest.mark.parametrize(
+    "overrides", [{"DA_LATEST_PATH": "Papers/"}, {"DA_LATEST_ANY_REF": "true"}]
+)
+def test_a_latest_input_without_the_latest_mode_fails_the_step(
+    tmp_path: Path, overrides: dict[str, str]
+) -> None:
+    result = _run_upload_step(tmp_path, **overrides)
+    assert result.returncode == 2
+    assert result.stdout.splitlines() == [
+        "::error::latest-path and latest-any-ref need latest: true"
+    ]
 
 
 @needs_bash
@@ -260,6 +326,9 @@ def test_input_defaults_match_the_documented_ones() -> None:
         "include-hidden-files": "false",
         "root": "GitHub Artifacts",
         "prune": "true",
+        "latest": "false",
+        "latest-path": "",
+        "latest-any-ref": "false",
         "source": f"drive-artifacts=={__version__}",
     }
     download = {k: v.get("default") for k, v in _load("download/action.yml")["inputs"].items()}
@@ -276,11 +345,14 @@ def test_input_defaults_match_the_documented_ones() -> None:
 
 
 def test_the_e2e_workflow_hands_the_client_secret_to_the_action_steps_only() -> None:
+    """The actions under test and the one step that runs the command line itself; no script of
+    the workflow's own ever sees it."""
     workflow = _load(".github/workflows/e2e.yml")
     for name, job in workflow["jobs"].items():
         assert "DRIVE_ARTIFACTS_CLIENT_SECRET" not in job.get("env", {}), name
         for step in job["steps"]:
-            if str(step.get("uses", "")).startswith("./"):
+            runs_the_cli = str(step.get("run", "")).startswith("uvx --no-config --from ")
+            if str(step.get("uses", "")).startswith("./") or runs_the_cli:
                 assert "DRIVE_ARTIFACTS_CLIENT_SECRET" in step["env"], name
             else:
                 assert "DRIVE_ARTIFACTS_CLIENT_SECRET" not in step.get("env", {}), name

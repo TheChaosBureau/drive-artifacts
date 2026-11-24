@@ -30,8 +30,13 @@ from drive_artifacts.errors import (
     NotFoundError,
     UsageError,
 )
-from drive_artifacts.github import Actions, read_run_context
-from drive_artifacts.model import ArtifactRecord, RunContext, validate_artifact_name
+from drive_artifacts.github import Actions, default_branch, read_run_context
+from drive_artifacts.model import (
+    ArtifactRecord,
+    RunContext,
+    latest_location,
+    validate_artifact_name,
+)
 from drive_artifacts.oauth import RefreshingTokenSource, StoredToken, loopback_login, revoke
 from drive_artifacts.settings import Settings
 from drive_artifacts.store import ArtifactStore, validate_retention_days
@@ -81,26 +86,54 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", action="store_true", help="log what the command does to stderr")
     sub = p.add_subparsers(dest="command", required=True)
 
-    up = sub.add_parser("upload", help="zip files and store them as one artifact")
-    up.add_argument("--name", default="artifact")
+    up = sub.add_parser(
+        "upload",
+        help="zip files and store them as one artifact, or with --latest keep one plain file "
+        "at a fixed path",
+    )
+    # The zip-mode options default to None so that --latest can refuse one that was given.
+    up.add_argument("--name", help="artifact name (default: artifact)")
     up.add_argument(
         "--path",
         action="append",
         required=True,
         help="glob, directory or file; repeat or separate with newlines; `!` excludes",
     )
-    up.add_argument("--retention-days", type=int, default=90)
+    up.add_argument("--retention-days", type=int, help="1..400 (default: 90)")
     up.add_argument("--if-no-files-found", choices=["warn", "error", "ignore"], default="warn")
-    up.add_argument("--compression-level", type=int, default=6, choices=range(10), metavar="0..9")
-    up.add_argument("--overwrite", action="store_true")
+    up.add_argument(
+        "--compression-level", type=int, choices=range(10), metavar="0..9", help="(default: 6)"
+    )
+    up.add_argument("--overwrite", action="store_true", default=None)
     up.add_argument("--include-hidden-files", action="store_true")
     up.add_argument(
         "--prune",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="trash this repository's expired artifacts after the upload",
+        help="trash this repository's expired artifacts after the upload (default: on)",
     )
     up.add_argument("--json", action="store_true")
+    latest = up.add_argument_group(
+        "latest mode: one plain file, not zipped, no expiry, replaced in place under one link"
+    )
+    latest.add_argument(
+        "--latest",
+        action="store_true",
+        help="store the one file --path matches at a fixed path and replace it on every upload",
+    )
+    latest.add_argument(
+        "--latest-path",
+        help="path under the root folder; a trailing / keeps the file's own name "
+        "(default: Latest/<owner>/<repo>/<file name>)",
+    )
+    latest.add_argument(
+        "--default-branch",
+        help="the repository's default branch (read from the Actions event when omitted)",
+    )
+    latest.add_argument(
+        "--any-ref",
+        action="store_true",
+        help="allow --latest on a ref that is not the default branch",
+    )
     _context_flags(up)
 
     down = sub.add_parser("download", help="download and extract artifacts")
@@ -129,6 +162,12 @@ def _parser() -> argparse.ArgumentParser:
     ls.add_argument("--ref", help="list every artifact stored for this ref, newest first")
     ls.add_argument("--json", action="store_true")
     _context_flags(ls, with_run=False, with_attempt=False)
+
+    la = sub.add_parser(
+        "latest", help='list every "latest" file this app can see, with its link and source'
+    )
+    la.add_argument("--repo-id", help="only the files of this GitHub numeric repository id")
+    la.add_argument("--json", action="store_true")
 
     pr = sub.add_parser("prune", help="trash expired artifacts of this repository")
     pr.add_argument("--dry-run", action="store_true")
@@ -190,33 +229,104 @@ def _emit(e: Env, payload: object) -> None:
 
 
 # ----- commands ------------------------------------------------------------------
+ZIP_ONLY = ("name", "retention_days", "compression_level", "overwrite", "prune")
+LATEST_ONLY = ("latest_path", "default_branch", "any_ref")
+
+
+def _flag(dest: str) -> str:
+    return "--" + dest.replace("_", "-")
+
+
+def _no_files(e: Env, patterns: Sequence[str]) -> int:
+    """Nothing matched `--path`: fail, warn or stay quiet, as `--if-no-files-found` says."""
+    message = f"no files matched {' | '.join(p for p in patterns if p.strip())!r}"
+    if e.args.if_no_files_found == "error":
+        raise NoFilesError(message)
+    if e.args.if_no_files_found == "warn":
+        e.actions.warning(message)
+    return 0
+
+
+def _check_latest_ref(e: Env, ctx: RunContext) -> None:
+    """`--latest` replaces the canonical file, so only a run on the default branch may do it."""
+    a = e.args
+    if a.any_ref:
+        return
+    branch = a.default_branch or default_branch(e.env)
+    if branch is None:
+        raise UsageError(
+            "--latest runs only on the default branch, and this run does not say which that is; "
+            "pass --default-branch, or --any-ref to allow every ref"
+        )
+    if ctx.ref != f"refs/heads/{branch}":
+        raise UsageError(
+            f"--latest runs only on the default branch (refs/heads/{branch}), so that a pull "
+            f"request cannot replace the canonical file; this run is on {ctx.ref or 'no ref'!r}. "
+            "Pass --any-ref to allow it"
+        )
+
+
+def _upload_latest(e: Env, ctx: RunContext, patterns: Sequence[str]) -> int:
+    a = e.args
+    given = [_flag(dest) for dest in ZIP_ONLY if getattr(a, dest) is not None]
+    if given:
+        raise UsageError(f"{', '.join(given)} cannot be combined with --latest")
+    _check_latest_ref(e, ctx)  # before anything is read or sent
+    resolved = resolve_paths(patterns, e.cwd, include_hidden=a.include_hidden_files)
+    if not resolved.files:
+        return _no_files(e, patterns)
+    if len(resolved.files) != 1:
+        raise UsageError(
+            f"--latest stores one file, and --path matched {len(resolved.files)}; "
+            "name the one file, or upload each with its own step"
+        )
+    source = resolved.files[0]
+    folders, name = latest_location(a.latest_path, ctx.repo.slug, source.name)
+    log.info("uploading %s as the latest %s", source, "/".join([*folders, name]))
+    record = _store(e).put_latest(ctx, source, folders=folders, name=name)
+    e.actions.output("artifact-id", record.file_id)
+    e.actions.output("artifact-url", record.web_view_link)
+    e.actions.output("artifact-digest", f"sha256:{record.sha256}")
+    e.actions.output("size", str(record.size))
+    e.actions.summary(
+        f"- **{record.path}**: {record.size:,} bytes, the latest copy in Drive at "
+        f"[{record.name}]({record.web_view_link})"
+    )
+    e.actions.notice(f"latest {record.path}: {record.size} bytes, Drive file {record.file_id}")
+    _emit(e, record.to_json())
+    return 0
+
+
 def cmd_upload(e: Env) -> int:
-    """`upload`: resolve the paths, build one zip, store it, write the outputs, then prune."""
+    """`upload`: zip what `--path` matches and store it as one artifact of this run; with
+    `--latest`, store the one file it matches at a fixed path and replace it in place."""
     a = e.args
     ctx = _ctx(e)
-    name = validate_artifact_name(a.name)
-    validate_retention_days(a.retention_days)  # before anything is zipped or sent
     patterns = [line for chunk in a.path for line in chunk.splitlines()]
+    if a.latest:
+        return _upload_latest(e, ctx, patterns)
+    given = [_flag(dest) for dest in LATEST_ONLY if getattr(a, dest)]
+    if given:
+        raise UsageError(f"{', '.join(given)} needs --latest")
+    name = validate_artifact_name("artifact" if a.name is None else a.name)
+    retention_days = 90 if a.retention_days is None else a.retention_days
+    compression_level = 6 if a.compression_level is None else a.compression_level
+    validate_retention_days(retention_days)  # before anything is zipped or sent
     log.info("uploading %s from %s", name, patterns)
     resolved = resolve_paths(patterns, e.cwd, include_hidden=a.include_hidden_files)
     if not resolved.files and not resolved.empty_dirs:
-        message = f"no files matched {' | '.join(p for p in patterns if p.strip())!r}"
-        if a.if_no_files_found == "error":
-            raise NoFilesError(message)
-        if a.if_no_files_found == "warn":
-            e.actions.warning(message)
-        return 0
+        return _no_files(e, patterns)
     store = _store(e)
     with tempfile.TemporaryDirectory(prefix="drive-artifacts-") as td:
-        built = build_zip(resolved, Path(td) / f"{name}.zip", compression_level=a.compression_level)
+        built = build_zip(resolved, Path(td) / f"{name}.zip", compression_level=compression_level)
         record = store.put(
             ctx,
             name,
             built.path,
             sha256=built.sha256,
             size=built.size,
-            retention_days=a.retention_days,
-            overwrite=a.overwrite,
+            retention_days=retention_days,
+            overwrite=bool(a.overwrite),
         )
     e.actions.output("artifact-id", record.file_id)
     e.actions.output("artifact-url", record.web_view_link)
@@ -230,7 +340,7 @@ def cmd_upload(e: Env) -> int:
         f"uploaded {name}: {built.file_count} file(s), {record.size} bytes, "
         f"expires {record.expires.isoformat()}"
     )
-    if a.prune:
+    if a.prune is None or a.prune:
         try:
             pruned = store.prune(ctx.repo.id)
         except DriveArtifactsError as exc:
@@ -334,6 +444,23 @@ def cmd_list(e: Env) -> int:
     return 0
 
 
+def cmd_latest(e: Env) -> int:
+    """`latest`: every "latest" file this app can see in the Drive, whichever repository and
+    token uploaded it, with its link and what it was built from."""
+    a = e.args
+    log.info("listing the latest files%s", f" of repository {a.repo_id}" if a.repo_id else "")
+    records = _store(e).list_latest(repo_id=a.repo_id or None)
+    if a.json:
+        _emit(e, [r.to_json() for r in records])
+    else:
+        for r in records:
+            print(
+                f"{r.path}\t{r.repo}\t{r.commit}\t{r.uploaded}\t{r.web_view_link}",
+                file=e.stdout,
+            )
+    return 0
+
+
 def cmd_prune(e: Env) -> int:
     """`prune`: trash the repository's expired artifacts, or only name them with `--dry-run`."""
     a = e.args
@@ -425,6 +552,7 @@ COMMANDS: dict[str, Callable[[Env], int]] = {
     "upload": cmd_upload,
     "download": cmd_download,
     "list": cmd_list,
+    "latest": cmd_latest,
     "prune": cmd_prune,
     "login": cmd_login,
     "logout": cmd_logout,

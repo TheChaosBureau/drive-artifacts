@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import mimetypes
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 from drive_artifacts.archive import sha256_file
@@ -18,15 +20,18 @@ from drive_artifacts.errors import (
     UsageError,
 )
 from drive_artifacts.model import (
+    DEFAULT_MIME,
     FOLDER_MIME,
     ArtifactKey,
     ArtifactRecord,
+    LatestRecord,
     Repo,
     RunContext,
     artifact_properties,
     escape,
     fit_ref,
     folder_properties,
+    latest_properties,
     prop,
     query,
     validate_artifact_name,
@@ -46,20 +51,31 @@ def _utc_today() -> date:
     return datetime.now(UTC).date()
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 def _oldest(files: list[DriveFile]) -> DriveFile | None:
     return min(files, key=lambda f: (f.created_time, f.id)) if files else None
 
 
 class ArtifactStore:
     """Artifacts in Drive: one root folder, one folder per repository, one zip per artifact,
-    identity in `appProperties`."""
+    identity in `appProperties`. Beside them, "latest" files: one plain file at a fixed path,
+    replaced in place."""
 
     def __init__(
-        self, drive: DriveClient, *, root_name: str, today: Callable[[], date] = _utc_today
+        self,
+        drive: DriveClient,
+        *,
+        root_name: str,
+        today: Callable[[], date] = _utc_today,
+        now: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._drive = drive
         self._root_name = root_name
         self._today = today
+        self._now = now
 
     # ----- folders -----------------------------------------------------------
     def _folder(self, q: str, create: Callable[[], DriveFile] | None) -> DriveFile | None:
@@ -278,3 +294,110 @@ class ArtifactStore:
             for record in expired:
                 self._drive.trash(record.file_id)
         return expired
+
+    # ----- latest files ------------------------------------------------------
+    def _latest_folder(self, folders: Sequence[str]) -> DriveFile:
+        """The folder a "latest" path ends in, created step by step where it is missing."""
+        folder = self.root_folder(create=True)
+        for name in folders:
+            if folder is None:  # pragma: no cover - create=True never yields None
+                break
+            parent = folder.id
+            q = query(
+                prop("da.kind", "dir"),
+                f"name = '{escape(name)}'",
+                f"'{escape(parent)}' in parents",
+                f"mimeType = '{FOLDER_MIME}'",
+            )
+            folder = self._folder(
+                q,
+                partial(
+                    self._drive.create_folder,
+                    name,
+                    parent=parent,
+                    app_properties=folder_properties("dir"),
+                ),
+            )
+        if folder is None:  # pragma: no cover - create=True never yields None
+            raise DriveError("could not resolve the folder of the latest path")
+        return folder
+
+    def _latest_files(self, folder_id: str, name: str) -> list[DriveFile]:
+        return self._drive.list_files(
+            query(
+                prop("da.kind", "latest"),
+                f"name = '{escape(name)}'",
+                f"'{escape(folder_id)}' in parents",
+            )
+        )
+
+    def put_latest(
+        self,
+        ctx: RunContext,
+        path: Path,
+        *,
+        folders: Sequence[str],
+        name: str,
+        mime: str | None = None,
+    ) -> LatestRecord:
+        """Store `path` as the one plain file `name` in `folders` under the root, and return its
+        record.
+
+        The first upload creates the file. Every later one replaces the content of that same
+        Drive file, so its id and its link stay as they are. Nothing expires. Should two first
+        uploads race, both end on the older file and the newer one is trashed.
+        """
+        sha256 = sha256_file(path)
+        size = path.stat().st_size
+        kind = mime or mimetypes.guess_type(name)[0] or DEFAULT_MIME
+        props = latest_properties(
+            ctx,
+            folder="/".join(folders),
+            sha256=sha256,
+            uploaded=self._now().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        folder = self._latest_folder(folders)
+        target = _oldest(self._latest_files(folder.id, name))
+        if target is None:
+            stored = self._drive.upload_file(
+                path, name=name, parent=folder.id, app_properties=props, mime=kind
+            )
+        else:
+            stored = self._drive.update_file(target.id, path, app_properties=props, mime=kind)
+        # One file per path. The oldest is the one whose link people hold: if ours is a newer
+        # one (a racing first upload), the content moves to the oldest and ours goes.
+        present = self._latest_files(folder.id, name)
+        keeper = _oldest(present)
+        if keeper is not None and keeper.id != stored.id:
+            stored = self._drive.update_file(keeper.id, path, app_properties=props, mime=kind)
+        for other in present:
+            if other.id != stored.id:
+                self._drive.trash(other.id)
+        if stored.size is None or not stored.web_view_link or not stored.app_properties:
+            # As in `put`: the last chunk's answer may come without the requested fields.
+            stored = self._drive.get_file(stored.id)
+        record = LatestRecord.from_drive(stored.as_mapping())
+        if record.size != size:
+            # Not trashed: the file is the canonical one, and the next upload replaces it again.
+            raise DriveError(
+                f"Drive recorded {record.size} bytes for a {size}-byte upload of {record.path!r}",
+                reason="sizeMismatch",
+            )
+        return record
+
+    def list_latest(self, *, repo_id: str | None = None) -> list[LatestRecord]:
+        """Every "latest" file this app can see, by path; optionally of one repository only.
+
+        Not limited to the configured root folder: what the app can see is every file it
+        created for this Google account, whichever token asks.
+        """
+        terms = [prop("da.kind", "latest")]
+        if repo_id is not None:
+            terms.append(prop("da.repo", repo_id))
+        records: list[LatestRecord] = []
+        for file in self._drive.list_files(query(*terms)):
+            try:
+                records.append(LatestRecord.from_drive(file.as_mapping()))
+            except ValueError:
+                continue  # another schema version or a corrupt file: not ours to report
+        return sorted(records, key=lambda r: (r.path, r.created_time, r.file_id))
